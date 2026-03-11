@@ -46,6 +46,13 @@ import unittest
 _TEST_DIR  = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.join(_TEST_DIR, "jax-fem")          # cloned repo
 _BENCHMARKS_PKG = "tests.benchmarks"                      # top-level import path
+_DATA_DIR = os.path.join(_TEST_DIR, "data", "test_a")
+os.makedirs(_DATA_DIR, exist_ok=True)
+
+if _TEST_DIR not in sys.path:
+    sys.path.append(_TEST_DIR)
+
+from paraview_output import copy_static_case
 
 # ---------------------------------------------------------------------------
 # 2. Ensure jax_fem resolves to the conda environment
@@ -94,6 +101,18 @@ def _run_benchmark_module(dotted_module: str, test_class_name: str = "Test"):
     return runner.run(suite)
 
 
+def _export_benchmark_case(module_path: str):
+    """Copy the benchmark VTU into a local ParaView case folder."""
+    import importlib
+
+    module = importlib.import_module(module_path)
+    module_dir = os.path.dirname(os.path.abspath(module.__file__))
+    source_vtu = os.path.join(module_dir, "jax_fem", "sol.vtu")
+    case_name = module_path.split(".")[-2]
+    case_dir = os.path.join(_DATA_DIR, case_name)
+    copy_static_case(source_vtu, case_dir, case_name=case_name)
+
+
 # ---------------------------------------------------------------------------
 # Test suite
 # ---------------------------------------------------------------------------
@@ -106,6 +125,8 @@ class TestBuiltinBenchmarks(unittest.TestCase):
 
     def _assert_benchmark(self, module_path: str, class_name: str = "Test"):
         result = _run_benchmark_module(module_path, class_name)
+        if result.wasSuccessful():
+            _export_benchmark_case(module_path)
         self.assertTrue(
             result.wasSuccessful(),
             f"\nBenchmark  {module_path}::{class_name}  FAILED.\n"

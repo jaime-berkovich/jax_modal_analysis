@@ -59,14 +59,19 @@ from jax import config
 
 config.update("jax_enable_x64", True)
 
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TEST_DIR not in sys.path:
+    sys.path.append(_TEST_DIR)
+
 from jax_fem.generate_mesh import Mesh, box_mesh, rectangle_mesh, get_meshio_cell_type
 from jax_fem.problem import Problem
 from jax_fem.solver import solver
+from paraview_output import save_static_case
 
 # ---------------------------------------------------------------------------
-# Output directory (VTU files written here when save_sol is used)
+# Output directory for ParaView case folders
 # ---------------------------------------------------------------------------
-_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_b")
+_DATA_DIR = os.path.join(_TEST_DIR, "data", "test_b")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -194,6 +199,13 @@ class TestHyperelastic3D(unittest.TestCase):
                                 dirichlet_bc_info=dirichlet_bc_info)
         sol_list = solver(problem)
         u = np.array(sol_list[0])
+        save_static_case(
+            problem.fes[0],
+            sol_list[0],
+            os.path.join(_DATA_DIR, "b1_zero_bc"),
+            case_name="b1_zero_bc",
+            point_infos=[("u_mag", np.linalg.norm(u, axis=1))],
+        )
         npt.assert_allclose(u, 0.0, atol=1e-10,
                             err_msg="Zero BCs must give the trivial zero solution.")
 
@@ -268,8 +280,21 @@ class TestHyperelastic3D(unittest.TestCase):
                                   for c in sample_idx
                                   for q in range(n_quads)])
 
+        P_zz_cells = np.array([
+            np.mean([_P_zz(u_grads[cell_idx, quad_idx]) for quad_idx in range(n_quads)])
+            for cell_idx in range(n_cells)
+        ])
         P_zz_fem      = float(np.mean(P_zz_samples))
         P_zz_analytic = _analytical_P_zz(lam)
+
+        save_static_case(
+            problem.fes[0],
+            sol_list[0],
+            os.path.join(_DATA_DIR, "b2_constrained_uniaxial"),
+            case_name="b2_constrained_uniaxial",
+            cell_infos=[("Pzz", P_zz_cells)],
+            point_infos=[("u_mag", np.linalg.norm(np.array(sol_list[0]), axis=1))],
+        )
 
         print(f"\n[B-2] Constrained uniaxial tension (λ = {lam}):")
         print(f"  Analytical P_zz = {P_zz_analytic:.6f}")
@@ -329,6 +354,14 @@ class TestHyperelastic3D(unittest.TestCase):
         u_z = u[:, 2]
         z   = pts[:, 2]
 
+        save_static_case(
+            problem.fes[0],
+            sol_list[0],
+            os.path.join(_DATA_DIR, "b3_affine_field"),
+            case_name="b3_affine_field",
+            point_infos=[("u_mag", np.linalg.norm(u, axis=1))],
+        )
+
         npt.assert_allclose(u_x, 0.0, atol=1e-10,
                             err_msg="u_x must be zero (constrained uniaxial).")
         npt.assert_allclose(u_y, 0.0, atol=1e-10,
@@ -386,6 +419,13 @@ class TestHyperelastic2D(unittest.TestCase):
                                 dirichlet_bc_info=dirichlet_bc_info)
         sol_list = solver(problem)
         u2d = np.array(sol_list[0])
+        save_static_case(
+            problem.fes[0],
+            sol_list[0],
+            os.path.join(_DATA_DIR, "b4_rectangle_tension"),
+            case_name="b4_rectangle_tension",
+            point_infos=[("u_mag", np.linalg.norm(u2d, axis=1))],
+        )
 
         max_ux = float(np.max(u2d[:, 0]))
         print(f"\n[B-4] 2-D rectangle tension: max u_x = {max_ux:.8f}  (applied δ = {delta_2d})")
@@ -429,6 +469,13 @@ class TestHyperelastic2D(unittest.TestCase):
         sol_list = solver(problem)
         u2d = np.array(sol_list[0])
         pts = self.mesh.points
+        save_static_case(
+            problem.fes[0],
+            sol_list[0],
+            os.path.join(_DATA_DIR, "b5_rowwise_monotonicity"),
+            case_name="b5_rowwise_monotonicity",
+            point_infos=[("u_mag", np.linalg.norm(u2d, axis=1))],
+        )
 
         # u_x should be monotonically non-decreasing with x on each row.
         ux = u2d[:, 0]

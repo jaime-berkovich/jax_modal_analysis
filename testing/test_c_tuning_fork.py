@@ -102,14 +102,18 @@ from jax import config
 
 config.update("jax_enable_x64", True)
 
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TEST_DIR not in sys.path:
+    sys.path.append(_TEST_DIR)
+
 from jax_fem.generate_mesh import Mesh, box_mesh, get_meshio_cell_type
 from jax_fem.problem import Problem
+from paraview_output import save_mode_collection
 
 # ---------------------------------------------------------------------------
 # Output directory
 # ---------------------------------------------------------------------------
-_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "data", "test_c")
+_DATA_DIR = os.path.join(_TEST_DIR, "data", "test_c")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -348,18 +352,40 @@ class TestTuningForkModal(unittest.TestCase):
         eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
             cls.K_free, k=k_eig, M=cls.M_free, which="SM", tol=1e-8,
         )
-        cls.eigenvalues  = eigenvalues
-        cls.eigenvectors = eigenvectors
+        freqs_hz = np.sqrt(np.abs(np.real(eigenvalues))) / (2.0 * np.pi)
+        sort_idx = np.argsort(freqs_hz)
 
-        # Convert ω² → f [Hz]; take absolute value to handle near-zero negatives
-        cls.freqs_hz = np.sqrt(np.abs(np.real(eigenvalues))) / (2.0 * np.pi)
-        cls.freqs_sorted = np.sort(cls.freqs_hz)
+        cls.eigenvalues = np.real(eigenvalues[sort_idx])
+        cls.eigenvectors = np.real(eigenvectors[:, sort_idx])
+        cls.freqs_hz = freqs_hz[sort_idx]
+        cls.freqs_sorted = cls.freqs_hz
 
         # Filter out rigid-body / numerical-zero modes (f < 1 Hz)
-        cls.nonzero_freqs = cls.freqs_sorted[cls.freqs_sorted > 1.0]
+        nonzero_mask = cls.freqs_sorted > 1.0
+        cls.nonzero_freqs = cls.freqs_sorted[nonzero_mask]
+        cls.nonzero_eigenvectors = cls.eigenvectors[:, nonzero_mask]
+
+        mode_shapes = []
+        for mode_vector in cls.nonzero_eigenvectors.T:
+            full_dofs = np.zeros(cls.fe.num_total_dofs, dtype=np.float64)
+            full_dofs[cls.free_dofs] = mode_vector
+            mode_shape = full_dofs.reshape((len(cls.fe.points), cls.fe.vec))
+            max_mode_norm = np.max(np.linalg.norm(mode_shape, axis=1))
+            if max_mode_norm > 0.0:
+                mode_shape = mode_shape / max_mode_norm
+            mode_shapes.append(mode_shape)
+
+        cls.mode_pvd_path = save_mode_collection(
+            cls.fe,
+            mode_shapes,
+            os.path.join(_DATA_DIR, "tuning_fork_modes"),
+            case_name="tuning_fork_modes",
+            mode_times=cls.nonzero_freqs,
+        )
 
         print(f"[test_c] Natural frequencies (Hz): {np.round(cls.freqs_sorted, 2)}")
         print(f"[test_c] Non-zero frequencies:     {np.round(cls.nonzero_freqs, 2)}")
+        print(f"[test_c] ParaView case: {cls.mode_pvd_path}")
 
         # Analytical reference values
         for n in range(1, 4):
