@@ -23,5 +23,9 @@ testing/data/test_c/cantilever_beam_modes/
 # Generated solver iteration dumps under tracked test trees
 testing/data/**/vtu/solve_*.vtu
 
+# VTU and PVD files (large and recreatable)
+*.vtu
+*.pvd
+
 # Generic local logs / scratch
 *.log
