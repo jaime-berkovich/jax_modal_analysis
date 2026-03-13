@@ -4,9 +4,7 @@ import argparse
 import math
 import os
 import re
-import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,13 +40,6 @@ class TetMeshingOptions:
     gmsh_optimize: bool = True
     gmsh_optimize_netgen: bool = True
     tetgen_switches: str = "pVCRq1.4"
-    ftetwild_ideal_edge_length: Optional[float] = None
-    ftetwild_epsr: Optional[float] = None
-    ftetwild_stop_energy: Optional[float] = None
-    ftetwild_max_threads: Optional[int] = None
-    ftetwild_quiet: bool = True
-    ftetwild_coarsen: bool = False
-    ftetwild_disable_filtering: bool = False
 
 
 @dataclass
@@ -103,35 +94,6 @@ def _require_tetgen():
             "Install tetgen in the active environment."
         ) from exc
     return tetgen
-
-
-def _require_pytetwild():
-    try:
-        import pytetwild  # type: ignore
-        return pytetwild
-    except Exception:
-        pass
-
-    repo_root = Path(__file__).resolve().parents[1]
-    vendor_src = repo_root / ".vendor" / "pytetwild" / "src"
-    package_dir = vendor_src / "pytetwild"
-    built_module = repo_root / ".vendor" / "pytetwild" / "build-manual" / "PyfTetWildWrapper.abi3.so"
-    if built_module.is_file() and package_dir.is_dir():
-        target = package_dir / built_module.name
-        if not target.exists():
-            shutil.copy2(built_module, target)
-    if vendor_src.is_dir() and str(vendor_src) not in sys.path:
-        sys.path.append(str(vendor_src))
-
-    try:
-        import pytetwild  # type: ignore
-        return pytetwild
-    except Exception as exc:
-        raise ImportError(
-            "pytetwild is required for the pytetwild mesher backend. "
-            "Install it in the active environment, or build the vendored "
-            "wrapper under .vendor/pytetwild."
-        ) from exc
 
 
 def _faces_to_pv(faces: Array) -> Array:
@@ -436,52 +398,6 @@ def _extract_tetra_cells(mesh: meshio.Mesh) -> Array:
     return np.vstack(tet_blocks).astype(np.int32)
 
 
-def tetrahedralize_with_pytetwild(
-    surface_vertices: Array,
-    surface_faces: Array,
-    options: Optional[TetMeshingOptions] = None,
-) -> tuple[Array, Array, Dict[str, Any]]:
-    """Tetrahedralize a cleaned surface with the pytetwild Python wrapper."""
-    opts = options or TetMeshingOptions()
-    pytetwild = _require_pytetwild()
-
-    faces = np.asarray(surface_faces, dtype=np.int32)
-    vertices = np.asarray(surface_vertices, dtype=np.float64)
-    epsilon = float(opts.ftetwild_epsr) if opts.ftetwild_epsr is not None else 1.0e-3
-    stop_energy = float(opts.ftetwild_stop_energy) if opts.ftetwild_stop_energy is not None else 10.0
-    num_threads = int(opts.ftetwild_max_threads) if opts.ftetwild_max_threads is not None else 0
-
-    points, cells = pytetwild.tetrahedralize(
-        vertices,
-        faces,
-        edge_length_fac=0.05,
-        edge_length_abs=opts.ftetwild_ideal_edge_length,
-        optimize=True,
-        simplify=False,
-        epsilon=epsilon,
-        stop_energy=stop_energy,
-        coarsen=bool(opts.ftetwild_coarsen),
-        num_threads=num_threads,
-        num_opt_iter=80,
-        loglevel=0 if not opts.ftetwild_quiet else 6,
-        quiet=bool(opts.ftetwild_quiet),
-        vtk_ordering=False,
-        disable_filtering=bool(opts.ftetwild_disable_filtering),
-    )
-    points = np.asarray(points, dtype=np.float64)
-    cells = np.asarray(cells, dtype=np.int32)
-    if cells.size == 0:
-        raise RuntimeError("pytetwild produced zero tetrahedra")
-    meta = {
-        "pytetwild_version": getattr(pytetwild, "__version__", "unknown"),
-        "pytetwild_disable_filtering": bool(opts.ftetwild_disable_filtering),
-        "pytetwild_stop_energy": stop_energy,
-        "pytetwild_epsilon": epsilon,
-        "pytetwild_num_threads": num_threads,
-    }
-    return points, cells, meta
-
-
 def save_tetmesh_vtu(
     path: str | os.PathLike[str],
     points: Array,
@@ -511,10 +427,7 @@ def stl_to_tetmesh(
     meshing = meshing_options or TetMeshingOptions()
     requested = meshing.mesher.lower()
     fallback = meshing.fallback_mesher.lower() if meshing.fallback_mesher else None
-    alias_map = {"ftetwild": "pytetwild"}
-    requested = alias_map.get(requested, requested)
-    fallback = alias_map.get(fallback, fallback) if fallback is not None else None
-    supported_meshers = {"auto", "gmsh", "tetgen", "pytetwild", "ftetwild"}
+    supported_meshers = {"auto", "gmsh", "tetgen"}
     if requested not in supported_meshers:
         raise ValueError(f"unsupported mesher '{requested}'")
     if fallback is not None and fallback not in (supported_meshers - {"auto"}):
@@ -526,7 +439,7 @@ def stl_to_tetmesh(
     )
 
     if requested == "auto":
-        try_order = ["gmsh", "tetgen", "pytetwild"]
+        try_order = ["gmsh", "tetgen"]
     else:
         try_order = [requested]
         if fallback and fallback not in try_order:
@@ -540,10 +453,6 @@ def stl_to_tetmesh(
                 points, cells = tetrahedralize_with_gmsh(surface_vertices, surface_faces, meshing)
             elif mesher_name == "tetgen":
                 points, cells = tetrahedralize_with_tetgen(surface_vertices, surface_faces, meshing)
-            elif mesher_name == "pytetwild":
-                points, cells, mesher_meta = tetrahedralize_with_pytetwild(
-                    surface_vertices, surface_faces, meshing
-                )
             else:
                 raise ValueError(f"unsupported mesher '{mesher_name}'")
             return TetMeshResult(
@@ -566,12 +475,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("stl_path", help="input STL surface")
     parser.add_argument(
         "--mesher",
-        choices=("auto", "gmsh", "tetgen", "pytetwild", "ftetwild"),
+        choices=("auto", "gmsh", "tetgen"),
         default="auto",
     )
     parser.add_argument(
         "--fallback-mesher",
-        choices=("gmsh", "tetgen", "pytetwild", "ftetwild"),
+        choices=("gmsh", "tetgen"),
         default=None,
     )
     parser.add_argument("--out-vtu", default=None, help="optional VTU output path")
@@ -579,13 +488,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gmsh-size-min", type=float, default=None)
     parser.add_argument("--gmsh-size-max", type=float, default=None)
     parser.add_argument("--tetgen-switches", default="pVCRq1.4")
-    parser.add_argument("--ftetwild-ideal-edge-length", type=float, default=None)
-    parser.add_argument("--ftetwild-epsr", type=float, default=None)
-    parser.add_argument("--ftetwild-stop-energy", type=float, default=None)
-    parser.add_argument("--ftetwild-max-threads", type=int, default=None)
-    parser.add_argument("--ftetwild-verbose", action="store_true")
-    parser.add_argument("--ftetwild-coarsen", action="store_true")
-    parser.add_argument("--ftetwild-disable-filtering", action="store_true")
     parser.add_argument("--skip-hole-fill", action="store_true")
     parser.add_argument("--skip-meshfix", action="store_true")
     parser.add_argument("--skip-largest-component", action="store_true")
@@ -607,13 +509,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         gmsh_size_min=args.gmsh_size_min,
         gmsh_size_max=args.gmsh_size_max,
         tetgen_switches=args.tetgen_switches,
-        ftetwild_ideal_edge_length=args.ftetwild_ideal_edge_length,
-        ftetwild_epsr=args.ftetwild_epsr,
-        ftetwild_stop_energy=args.ftetwild_stop_energy,
-        ftetwild_max_threads=args.ftetwild_max_threads,
-        ftetwild_quiet=not args.ftetwild_verbose,
-        ftetwild_coarsen=bool(args.ftetwild_coarsen),
-        ftetwild_disable_filtering=bool(args.ftetwild_disable_filtering),
     )
     result = stl_to_tetmesh(args.stl_path, repair_options=repair, meshing_options=meshing)
 

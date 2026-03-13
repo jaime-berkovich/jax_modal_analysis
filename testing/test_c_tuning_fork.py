@@ -1,6 +1,6 @@
 """
-Test Suite C — Modal analysis of a tuning fork tine
-====================================================
+Test Suite C — Cantilever beam modal validation
+===============================================
 
 jax_fem is a static/quasi-static nonlinear solver and has no built-in
 eigenvalue solver.  This test suite demonstrates how to leverage jax_fem's
@@ -10,8 +10,7 @@ against the classical Euler-Bernoulli cantilever beam theory.
 
 Geometry
 --------
-A single tine of a tuning fork is modelled as a rectangular prismatic
-cantilever beam (steel, A440 standard)::
+A fixed-free rectangular cantilever beam is modelled as a 3-D solid::
 
     Length L  = 65 mm   (0.065 m)   — along x-axis
     Width  b  = 4  mm   (0.004 m)
@@ -35,7 +34,8 @@ Method
 4. Apply cantilever BCs by removing clamped DOFs (row/column
    elimination).
 5. Solve the generalised eigenproblem  K v = ω² M v  using
-   ``scipy.sparse.linalg.eigsh`` (ARPACK, shift-invert mode).
+   ``scipy.sparse.linalg.eigsh`` (ARPACK, shift-invert mode with
+   ``sigma=0``).
 6. Compare FEM natural frequencies against Euler-Bernoulli formulae.
 
 Analytical reference (Euler-Bernoulli cantilever)
@@ -87,7 +87,9 @@ Usage
     conda run -n jax_fem python -m pytest test_c_tuning_fork.py -v
 """
 
+import csv
 import os
+import shutil
 import sys
 import unittest
 
@@ -108,7 +110,10 @@ if _TEST_DIR not in sys.path:
 
 from jax_fem.generate_mesh import Mesh, box_mesh, get_meshio_cell_type
 from jax_fem.problem import Problem
-from paraview_output import save_mode_collection
+from paraview_output import save_mode_animation
+
+# Fraction of beam length used as peak mode-shape displacement for animation.
+_MODE_DISP_FRACTION = 0.10
 
 # ---------------------------------------------------------------------------
 # Output directory
@@ -119,7 +124,7 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 # Geometry (SI: metres, kg, Pa)
 # ---------------------------------------------------------------------------
-L = 0.065      # tine length   [m]
+L = 0.065      # beam length   [m]
 b = 0.004      # tine width    [m]
 h = 0.004      # tine height   [m]  (square cross-section)
 
@@ -285,12 +290,105 @@ def apply_cantilever_bc(K, M, fe):
     return K_free, M_free, free_dofs
 
 
+def _direction_vector(direction_idx, num_total_dofs, free_dofs, vec):
+    """Build a rigid-body direction vector for the given component (0=X, 1=Y, 2=Z)."""
+    r_full = np.zeros(num_total_dofs, dtype=np.float64)
+    r_full[direction_idx::vec] = 1.0
+    return r_full[free_dofs]
+
+
+def modal_report_rows(
+    freqs_hz,
+    eigenvectors_free,
+    M_free,
+    free_dofs,
+    num_total_dofs,
+    total_mass_physical,
+    vec=3,
+):
+    """Compute modal participation/effective-mass metrics in all 3 directions.
+
+    Returns one row per (mode, direction) combination, plus a dominant-direction
+    classification for each mode.
+    """
+    dir_labels = {0: "X", 1: "Y", 2: "Z"}
+    r_vecs = {
+        d: _direction_vector(d, num_total_dofs, free_dofs, vec)
+        for d in dir_labels
+    }
+
+    rows = []
+
+    for mode_idx, (freq, phi) in enumerate(
+        zip(freqs_hz, eigenvectors_free.T), start=1
+    ):
+        phi = np.asarray(phi, dtype=np.float64)
+        modal_mass = float(phi @ (M_free @ phi))
+
+        eff_by_dir = {}
+        pf_by_dir = {}
+        for d, r_free in r_vecs.items():
+            gen_force = float(phi @ (M_free @ r_free))
+            if modal_mass > 0.0:
+                pf_by_dir[d] = gen_force / modal_mass
+                eff_by_dir[d] = gen_force**2 / modal_mass
+            else:
+                pf_by_dir[d] = 0.0
+                eff_by_dir[d] = 0.0
+
+        dominant_dir = max(eff_by_dir, key=eff_by_dir.get)
+        dominant_label = dir_labels[dominant_dir]
+
+        for d, label in dir_labels.items():
+            eff_mass = eff_by_dir[d]
+            rows.append(
+                {
+                    "mode": mode_idx,
+                    "frequency_hz": float(freq),
+                    "period_s": (1.0 / float(freq)) if freq > 0.0 else np.nan,
+                    "direction": label,
+                    "dominant_direction": dominant_label,
+                    "participation_factor": pf_by_dir[d],
+                    "modal_mass_kg": modal_mass,
+                    "effective_mass_kg": eff_mass,
+                    "ratio_eff_mass_to_total_mass": (
+                        eff_mass / total_mass_physical
+                        if total_mass_physical > 0.0
+                        else 0.0
+                    ),
+                }
+            )
+
+    return rows
+
+
+def write_modal_report_csv(csv_path, rows):
+    """Write modal analysis CSV report covering all directions."""
+    fieldnames = [
+        "mode",
+        "frequency_hz",
+        "period_s",
+        "direction",
+        "dominant_direction",
+        "participation_factor",
+        "effective_mass_kg",
+        "ratio_eff_mass_to_total_mass",
+        "modal_mass_kg",
+    ]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 # ---------------------------------------------------------------------------
 # One-time setup (shared across all test methods via class variable)
 # ---------------------------------------------------------------------------
 
-class TestTuningForkModal(unittest.TestCase):
-    """Modal analysis of a cantilever tine (tuning fork prong)."""
+class TestCantileverBeamModal(unittest.TestCase):
+    """Modal analysis of a fixed-free rectangular cantilever beam."""
 
     _setup_done = False   # guard so expensive assembly runs once
 
@@ -299,7 +397,7 @@ class TestTuningForkModal(unittest.TestCase):
         """Assemble K, M, solve eigenvalue problem once for all tests."""
 
         # --- Mesh ---
-        # 30 × 2 × 2 HEX8 elements; tine runs along x-axis
+        # 30 × 2 × 2 HEX8 elements; beam axis is x
         print(f"\n[test_c] Building mesh: 30×2×2 HEX8, "
               f"L={L*1e3:.0f} mm × b={b*1e3:.0f} mm × h={h*1e3:.0f} mm ...")
         meshio_mesh = box_mesh(Nx=30, Ny=2, Nz=2,
@@ -346,11 +444,13 @@ class TestTuningForkModal(unittest.TestCase):
               f"(clamped {cls.fe.num_total_dofs - n_free})")
 
         # --- Generalised eigenproblem  K v = ω² M v ---
-        # Request k=20 smallest eigenvalues (shift-invert for robustness)
-        print("[test_c] Solving K v = ω² M v  (ARPACK, k=20) ...")
+        # Shift-invert mode (sigma=0) is far more robust than which="SM"
+        # for finding the smallest eigenvalues of a generalised problem.
+        print("[test_c] Solving K v = ω² M v  (ARPACK shift-invert, k=20) ...")
         k_eig = 20
         eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
-            cls.K_free, k=k_eig, M=cls.M_free, which="SM", tol=1e-8,
+            cls.K_free, k=k_eig, M=cls.M_free,
+            sigma=0.0, which="LM", tol=1e-8,
         )
         freqs_hz = np.sqrt(np.abs(np.real(eigenvalues))) / (2.0 * np.pi)
         sort_idx = np.argsort(freqs_hz)
@@ -365,27 +465,72 @@ class TestTuningForkModal(unittest.TestCase):
         cls.nonzero_freqs = cls.freqs_sorted[nonzero_mask]
         cls.nonzero_eigenvectors = cls.eigenvectors[:, nonzero_mask]
 
+        # Total physical mass for effective-mass normalization.
+        M_row_sums = np.array(cls.M_full.sum(axis=1)).ravel()
+        cls.total_mass_physical = float(np.sum(M_row_sums)) / cls.fe.vec
+
+        # Expand free-DOF eigenvectors to full DOF vectors (clamped = 0).
         mode_shapes = []
         for mode_vector in cls.nonzero_eigenvectors.T:
             full_dofs = np.zeros(cls.fe.num_total_dofs, dtype=np.float64)
             full_dofs[cls.free_dofs] = mode_vector
             mode_shape = full_dofs.reshape((len(cls.fe.points), cls.fe.vec))
-            max_mode_norm = np.max(np.linalg.norm(mode_shape, axis=1))
-            if max_mode_norm > 0.0:
-                mode_shape = mode_shape / max_mode_norm
             mode_shapes.append(mode_shape)
 
-        cls.mode_pvd_path = save_mode_collection(
-            cls.fe,
-            mode_shapes,
-            os.path.join(_DATA_DIR, "tuning_fork_modes"),
-            case_name="tuning_fork_modes",
-            mode_times=cls.nonzero_freqs,
+        # Create separate animated PVD cases for first 3 vibration modes.
+        cls.mode_animation_paths = []
+        modes_root = os.path.join(_DATA_DIR, "cantilever_beam_modes")
+        if os.path.isdir(modes_root):
+            shutil.rmtree(modes_root)
+        os.makedirs(modes_root, exist_ok=True)
+
+        for mode_idx in range(min(3, len(mode_shapes))):
+            shape = mode_shapes[mode_idx]
+
+            # Scale the mode shape so its peak displacement equals a
+            # visible fraction of beam length.  Mass-normalised
+            # eigenvectors have arbitrary magnitude that can be orders
+            # of magnitude larger than the geometry; without scaling
+            # the animation is meaningless.
+            max_disp = np.max(np.linalg.norm(shape, axis=1))
+            if max_disp > 0.0:
+                amplitude = _MODE_DISP_FRACTION * L / max_disp
+            else:
+                amplitude = 1.0
+
+            mode_case_dir = os.path.join(modes_root, f"mode_{mode_idx + 1:02d}")
+            mode_case_name = f"mode_{mode_idx + 1:02d}_animation"
+            pvd_path = save_mode_animation(
+                cls.fe,
+                shape,
+                mode_case_dir,
+                case_name=mode_case_name,
+                num_frames=31,
+                amplitude=amplitude,
+                cycles=1.0,
+            )
+            cls.mode_animation_paths.append(pvd_path)
+
+        cls.modal_rows = modal_report_rows(
+            cls.nonzero_freqs,
+            cls.nonzero_eigenvectors,
+            cls.M_free,
+            cls.free_dofs,
+            cls.fe.num_total_dofs,
+            cls.total_mass_physical,
+            vec=cls.fe.vec,
         )
+        cls.modal_csv_path = os.path.join(
+            modes_root, "cantilever_beam_modal_report.csv"
+        )
+        write_modal_report_csv(cls.modal_csv_path, cls.modal_rows)
 
         print(f"[test_c] Natural frequencies (Hz): {np.round(cls.freqs_sorted, 2)}")
         print(f"[test_c] Non-zero frequencies:     {np.round(cls.nonzero_freqs, 2)}")
-        print(f"[test_c] ParaView case: {cls.mode_pvd_path}")
+        print("[test_c] Per-mode animation PVDs:")
+        for p in cls.mode_animation_paths:
+            print(f"  - {p}")
+        print(f"[test_c] Modal report CSV: {cls.modal_csv_path}")
 
         # Analytical reference values
         for n in range(1, 4):

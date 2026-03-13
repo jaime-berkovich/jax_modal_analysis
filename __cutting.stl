@@ -1,0 +1,86 @@
+solid __cutting.stl
+facet normal 0 0 0
+outer loop
+vertex 2.688000e+01 5.504000e+01 1.320000e+00
+vertex 2.677000e+01 5.504000e+01 1.200000e+00
+vertex 2.677000e+01 5.419947e+01 1.200000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.677000e+01 5.504000e+01 1.200000e+00
+vertex 2.688000e+01 5.024000e+01 5.999994e-01
+vertex 2.677000e+01 5.419947e+01 1.200000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.677000e+01 5.494801e+01 5.999994e-01
+vertex 2.688000e+01 5.024000e+01 5.999994e-01
+vertex 2.677000e+01 5.504000e+01 1.200000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.688000e+01 5.024000e+01 5.999994e-01
+vertex 2.688000e+01 5.024000e+01 1.320000e+00
+vertex 2.677000e+01 5.024000e+01 1.200000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 1.001143e+01 1.824000e+01 5.999994e-01
+vertex 1.023900e+01 1.877100e+01 5.999994e-01
+vertex 1.023900e+01 1.877100e+01 1.200000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 1.023900e+01 1.877100e+01 5.999994e-01
+vertex 1.001143e+01 1.824000e+01 5.999994e-01
+vertex 1.023900e+01 1.877100e+01 1.200000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.688000e+01 5.024000e+01 5.999994e-01
+vertex 2.677000e+01 5.419947e+01 1.200000e+00
+vertex 2.688000e+01 5.024000e+01 1.320000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.677000e+01 5.504000e+01 1.200000e+00
+vertex 2.688000e+01 5.504000e+01 1.320000e+00
+vertex 2.677000e+01 5.419947e+01 1.200000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.677000e+01 5.504000e+01 1.200000e+00
+vertex 2.677000e+01 5.419947e+01 1.200000e+00
+vertex 2.688000e+01 5.024000e+01 5.999994e-01
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.677000e+01 5.494801e+01 5.999994e-01
+vertex 2.677000e+01 5.504000e+01 1.200000e+00
+vertex 2.688000e+01 5.024000e+01 5.999994e-01
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.688000e+01 5.024000e+01 5.999994e-01
+vertex 2.688000e+01 5.024000e+01 1.320000e+00
+vertex 2.677000e+01 5.419947e+01 1.200000e+00
+endloop
+endfacet
+facet normal 0 0 0
+outer loop
+vertex 2.688000e+01 5.024000e+01 1.320000e+00
+vertex 2.688000e+01 5.024000e+01 5.999994e-01
+vertex 2.677000e+01 5.024000e+01 1.200000e+00
+endloop
+endfacet
+endsolid __cutting.stl

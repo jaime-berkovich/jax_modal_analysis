@@ -2,11 +2,8 @@
 Test Suite A — jax-fem built-in benchmark tests
 ================================================
 
-Runs the official benchmark suite from the cloned repository at
+Runs the official benchmark suite from the vendored repository at
   testing/jax-fem/
-
-while importing jax_fem from the **conda environment** (not from the
-cloned source tree).
 
 Benchmarks included
 -------------------
@@ -22,12 +19,8 @@ directories.
 
 Path management
 ---------------
-The cloned repo root (``jax-fem/``) is appended to sys.path **after**
-the conda site-packages, so ``import jax_fem`` resolves to the conda
-installation.  The ``jax_fem`` module is imported once (cached in
-sys.modules) before the benchmark sub-modules are loaded, ensuring all
-``from jax_fem.xxx import ...`` statements inside the benchmark files
-also use the conda version.
+The vendored repo root (``jax-fem/``) is prepended to ``sys.path`` so
+the benchmark modules and the local helper patches use the same code.
 
 Usage
 -----
@@ -49,40 +42,21 @@ _BENCHMARKS_PKG = "tests.benchmarks"                      # top-level import pat
 _DATA_DIR = os.path.join(_TEST_DIR, "data", "test_a")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
+# Ensure vendored jax_fem resolves before importing local helpers that depend on it.
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 if _TEST_DIR not in sys.path:
     sys.path.append(_TEST_DIR)
 
-from paraview_output import copy_static_case
+from paraview_output import SolveHistoryRecorder, displacement_point_infos
 
 # ---------------------------------------------------------------------------
-# 2. Ensure jax_fem resolves to the conda environment
-#    - Remove any accidental entries that point inside the clone.
-#    - Import jax_fem NOW so it is cached before the clone root enters sys.path.
+# 2. Ensure jax_fem resolves to the vendored repository
 # ---------------------------------------------------------------------------
-sys.path = [p for p in sys.path
-            if os.path.realpath(p) != os.path.realpath(_REPO_ROOT)]
+import jax_fem as _jf
 
-try:
-    import jax_fem as _jf
-except ImportError as e:
-    raise ImportError(
-        "jax_fem is not importable.  "
-        "Activate the conda environment first:  conda activate jax_fem"
-    ) from e
-
-_jf_path = os.path.realpath(_jf.__file__)
-assert _REPO_ROOT not in _jf_path, (
-    f"jax_fem resolved to the cloned source, not the conda env!\n"
-    f"  resolved: {_jf_path}\n"
-    f"  repo:     {_REPO_ROOT}\n"
-    "Remove the repo root from PYTHONPATH or sys.path."
-)
-print(f"[test_a] jax_fem loaded from conda env: {_jf_path}")
-
-# 3. Now append the repo root so that ``tests.benchmarks.*`` are importable,
-#    but jax_fem is already cached from conda above.
-if _REPO_ROOT not in sys.path:
-    sys.path.append(_REPO_ROOT)
+print(f"[test_a] jax_fem loaded from vendored repo: {os.path.realpath(_jf.__file__)}")
 
 
 # ---------------------------------------------------------------------------
@@ -94,23 +68,41 @@ def _run_benchmark_module(dotted_module: str, test_class_name: str = "Test"):
     Returns a ``unittest.TestResult``.
     """
     import importlib
-    module = importlib.import_module(dotted_module)
-    test_class = getattr(module, test_class_name)
-    suite  = unittest.TestLoader().loadTestsFromTestCase(test_class)
-    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
-    return runner.run(suite)
+    import jax_fem.solver as solver_module
 
+    case_name = dotted_module.split(".")[-2]
+    recorder = SolveHistoryRecorder(
+        os.path.join(_DATA_DIR, case_name),
+        case_name=case_name,
+        point_infos_fn=displacement_point_infos,
+    )
+    original_solver = solver_module.solver
+    solve_index = {"value": 0}
 
-def _export_benchmark_case(module_path: str):
-    """Copy the benchmark VTU into a local ParaView case folder."""
-    import importlib
+    def wrapped_solver(problem, solver_options=None):
+        current_solve = solve_index["value"]
+        solve_index["value"] += 1
+        options = dict(solver_options or {})
+        options["snapshot_callback"] = (
+            lambda problem_, sol_list, iteration, **metadata: recorder.callback(
+                problem_,
+                sol_list,
+                iteration,
+                solve_index=current_solve,
+                **metadata,
+            )
+        )
+        return original_solver(problem, options)
 
-    module = importlib.import_module(module_path)
-    module_dir = os.path.dirname(os.path.abspath(module.__file__))
-    source_vtu = os.path.join(module_dir, "jax_fem", "sol.vtu")
-    case_name = module_path.split(".")[-2]
-    case_dir = os.path.join(_DATA_DIR, case_name)
-    copy_static_case(source_vtu, case_dir, case_name=case_name)
+    solver_module.solver = wrapped_solver
+    try:
+        module = importlib.import_module(dotted_module)
+        test_class = getattr(module, test_class_name)
+        suite = unittest.TestLoader().loadTestsFromTestCase(test_class)
+        runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
+        return runner.run(suite)
+    finally:
+        solver_module.solver = original_solver
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +117,6 @@ class TestBuiltinBenchmarks(unittest.TestCase):
 
     def _assert_benchmark(self, module_path: str, class_name: str = "Test"):
         result = _run_benchmark_module(module_path, class_name)
-        if result.wasSuccessful():
-            _export_benchmark_case(module_path)
         self.assertTrue(
             result.wasSuccessful(),
             f"\nBenchmark  {module_path}::{class_name}  FAILED.\n"

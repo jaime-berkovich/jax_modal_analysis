@@ -62,11 +62,14 @@ config.update("jax_enable_x64", True)
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TEST_DIR not in sys.path:
     sys.path.append(_TEST_DIR)
+_VENDORED_JAX_FEM_ROOT = os.path.join(_TEST_DIR, "jax-fem")
+if _VENDORED_JAX_FEM_ROOT not in sys.path:
+    sys.path.insert(0, _VENDORED_JAX_FEM_ROOT)
 
 from jax_fem.generate_mesh import Mesh, box_mesh, rectangle_mesh, get_meshio_cell_type
 from jax_fem.problem import Problem
 from jax_fem.solver import solver
-from paraview_output import save_static_case
+from paraview_output import SolveHistoryRecorder, displacement_point_infos
 
 # ---------------------------------------------------------------------------
 # Output directory for ParaView case folders
@@ -173,6 +176,48 @@ def _zero(point):
     return 0.0
 
 
+def _solve_with_history(problem, case_name, cell_infos_fn=None, solver_options=None):
+    recorder = SolveHistoryRecorder(
+        os.path.join(_DATA_DIR, case_name),
+        case_name=case_name,
+        point_infos_fn=displacement_point_infos,
+        cell_infos_fn=cell_infos_fn,
+    )
+    options = dict(solver_options or {})
+    options["snapshot_callback"] = lambda problem_, sol_list, iteration, **metadata: recorder.callback(
+        problem_,
+        sol_list,
+        iteration,
+        solve_index=0,
+        **metadata,
+    )
+    sol_list = solver(problem, options)
+    return sol_list
+
+
+def _first_pk_pzz(u_grad):
+    F = u_grad + np.eye(3)
+
+    def psi(F_):
+        Jf = jnp.linalg.det(F_)
+        I1f = jnp.trace(F_.T @ F_)
+        return ((MU / 2.0) * (Jf**(-2.0 / 3.0) * I1f - 3.0)
+                + (KAPPA / 2.0) * (Jf - 1.0)**2.0)
+
+    P = jax.grad(psi)(jnp.array(F))
+    return float(P[2, 2])
+
+
+def _cellwise_pzz(problem, sol):
+    fe = problem.fes[0]
+    u_grads = np.array(fe.sol_to_grad(sol))
+    n_cells, n_quads, _, _ = u_grads.shape
+    return np.array([
+        np.mean([_first_pk_pzz(u_grads[cell_idx, quad_idx]) for quad_idx in range(n_quads)])
+        for cell_idx in range(n_cells)
+    ])
+
+
 # ---------------------------------------------------------------------------
 # Tests — 3-D unit cube
 # ---------------------------------------------------------------------------
@@ -197,15 +242,8 @@ class TestHyperelastic3D(unittest.TestCase):
         ]
         problem  = NeoHookean3D(self.mesh, vec=3, dim=3,
                                 dirichlet_bc_info=dirichlet_bc_info)
-        sol_list = solver(problem)
+        sol_list = _solve_with_history(problem, "b1_zero_bc")
         u = np.array(sol_list[0])
-        save_static_case(
-            problem.fes[0],
-            sol_list[0],
-            os.path.join(_DATA_DIR, "b1_zero_bc"),
-            case_name="b1_zero_bc",
-            point_infos=[("u_mag", np.linalg.norm(u, axis=1))],
-        )
         npt.assert_allclose(u, 0.0, atol=1e-10,
                             err_msg="Zero BCs must give the trivial zero solution.")
 
@@ -255,46 +293,28 @@ class TestHyperelastic3D(unittest.TestCase):
 
         problem  = NeoHookean3D(self.mesh, vec=3, dim=3,
                                 dirichlet_bc_info=dirichlet_bc_info)
-        sol_list = solver(problem)
+        sol_list = _solve_with_history(
+            problem,
+            "b2_constrained_uniaxial",
+            cell_infos_fn=lambda problem_, sol_list_, metadata: [
+                ("Pzz", _cellwise_pzz(problem_, sol_list_[0]))
+            ],
+        )
 
         # --- Sample P_zz at all quadrature points ---
         fe      = problem.fes[0]
         u_grads = np.array(fe.sol_to_grad(sol_list[0]))
         # u_grads: (num_cells, num_quads, vec=3, dim=3)
 
-        def _P_zz(u_g):
-            F = u_g + np.eye(3)
-            J  = np.linalg.det(F)
-            I1 = np.trace(F.T @ F)
-            def psi(F_):
-                Jf  = jnp.linalg.det(F_)
-                I1f = jnp.trace(F_.T @ F_)
-                return ((MU / 2.0) * (Jf**(-2.0/3.0) * I1f - 3.0)
-                        + (KAPPA / 2.0) * (Jf - 1.0)**2.0)
-            P = jax.grad(psi)(jnp.array(F))
-            return float(P[2, 2])
-
         n_cells, n_quads, _, _ = u_grads.shape
         sample_idx = range(0, n_cells, max(1, n_cells // 8))
-        P_zz_samples = np.array([_P_zz(u_grads[c, q])
+        P_zz_samples = np.array([_first_pk_pzz(u_grads[c, q])
                                   for c in sample_idx
                                   for q in range(n_quads)])
 
-        P_zz_cells = np.array([
-            np.mean([_P_zz(u_grads[cell_idx, quad_idx]) for quad_idx in range(n_quads)])
-            for cell_idx in range(n_cells)
-        ])
+        P_zz_cells = _cellwise_pzz(problem, sol_list[0])
         P_zz_fem      = float(np.mean(P_zz_samples))
         P_zz_analytic = _analytical_P_zz(lam)
-
-        save_static_case(
-            problem.fes[0],
-            sol_list[0],
-            os.path.join(_DATA_DIR, "b2_constrained_uniaxial"),
-            case_name="b2_constrained_uniaxial",
-            cell_infos=[("Pzz", P_zz_cells)],
-            point_infos=[("u_mag", np.linalg.norm(np.array(sol_list[0]), axis=1))],
-        )
 
         print(f"\n[B-2] Constrained uniaxial tension (λ = {lam}):")
         print(f"  Analytical P_zz = {P_zz_analytic:.6f}")
@@ -345,7 +365,7 @@ class TestHyperelastic3D(unittest.TestCase):
 
         problem  = NeoHookean3D(self.mesh, vec=3, dim=3,
                                 dirichlet_bc_info=dirichlet_bc_info)
-        sol_list = solver(problem)
+        sol_list = _solve_with_history(problem, "b3_affine_field")
         u   = np.array(sol_list[0])
         pts = self.mesh.points
 
@@ -353,14 +373,6 @@ class TestHyperelastic3D(unittest.TestCase):
         u_y = u[:, 1]
         u_z = u[:, 2]
         z   = pts[:, 2]
-
-        save_static_case(
-            problem.fes[0],
-            sol_list[0],
-            os.path.join(_DATA_DIR, "b3_affine_field"),
-            case_name="b3_affine_field",
-            point_infos=[("u_mag", np.linalg.norm(u, axis=1))],
-        )
 
         npt.assert_allclose(u_x, 0.0, atol=1e-10,
                             err_msg="u_x must be zero (constrained uniaxial).")
@@ -417,15 +429,8 @@ class TestHyperelastic2D(unittest.TestCase):
 
         problem  = NeoHookean2D(self.mesh, vec=2, dim=2, ele_type="QUAD4",
                                 dirichlet_bc_info=dirichlet_bc_info)
-        sol_list = solver(problem)
+        sol_list = _solve_with_history(problem, "b4_rectangle_tension")
         u2d = np.array(sol_list[0])
-        save_static_case(
-            problem.fes[0],
-            sol_list[0],
-            os.path.join(_DATA_DIR, "b4_rectangle_tension"),
-            case_name="b4_rectangle_tension",
-            point_infos=[("u_mag", np.linalg.norm(u2d, axis=1))],
-        )
 
         max_ux = float(np.max(u2d[:, 0]))
         print(f"\n[B-4] 2-D rectangle tension: max u_x = {max_ux:.8f}  (applied δ = {delta_2d})")
@@ -466,16 +471,9 @@ class TestHyperelastic2D(unittest.TestCase):
 
         problem  = NeoHookean2D(self.mesh, vec=2, dim=2, ele_type="QUAD4",
                                 dirichlet_bc_info=dirichlet_bc_info)
-        sol_list = solver(problem)
+        sol_list = _solve_with_history(problem, "b5_rowwise_monotonicity")
         u2d = np.array(sol_list[0])
         pts = self.mesh.points
-        save_static_case(
-            problem.fes[0],
-            sol_list[0],
-            os.path.join(_DATA_DIR, "b5_rowwise_monotonicity"),
-            case_name="b5_rowwise_monotonicity",
-            point_infos=[("u_mag", np.linalg.norm(u2d, axis=1))],
-        )
 
         # u_x should be monotonically non-decreasing with x on each row.
         ux = u2d[:, 0]

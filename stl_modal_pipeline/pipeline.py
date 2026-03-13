@@ -3,13 +3,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 import shutil
 import sys
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import scipy.sparse
@@ -82,17 +85,11 @@ class PipelineConfig:
     material: MaterialProperties = field(default_factory=MaterialProperties)
     num_modes: int = 20
 
-    mesher: str = "auto"  # auto | gmsh | tetgen | pytetwild
+    mesher: str = "auto"  # auto | gmsh | tetgen
     fallback_mesher: Optional[str] = None
     target_edge_size_m: Optional[float] = None
     max_tet_volume_m3: Optional[float] = None
     tetgen_switches: str = "pVCRq1.4"
-    ftetwild_epsr: Optional[float] = None
-    ftetwild_stop_energy: Optional[float] = None
-    ftetwild_max_threads: Optional[int] = None
-    ftetwild_verbose: bool = False
-    ftetwild_coarsen: bool = False
-    ftetwild_disable_filtering: bool = False
     stl_length_scale: float = 1.0
     clean_stl: bool = False
     clean_keep_largest_component: bool = False
@@ -118,6 +115,8 @@ class PipelineConfig:
     mode_animation_frames: int = 24
     mode_animation_cycles: float = 1.0
     mode_animation_peak_fraction: float = 0.05
+    verbose: bool = False
+    solver_verbose: bool = False
 
     damping_ratio: Optional[float] = None
     rayleigh_alpha: float = 0.0
@@ -146,6 +145,53 @@ class LinearElasticModalProblem(Problem):
             return sigma
 
         return stress
+
+
+def _create_run_logger(output_dir: Path, verbose: bool) -> Tuple[logging.Logger, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "pipeline.log"
+
+    logger = logging.getLogger("stl_modal_pipeline")
+    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="[%(asctime)s][%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO if verbose else logging.WARNING)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger, log_path
+
+
+@contextmanager
+def _timed_stage(
+    logger: logging.Logger,
+    stage_timings_s: Dict[str, float],
+    name: str,
+) -> Iterator[None]:
+    logger.info("Stage start: %s", name)
+    start = time.perf_counter()
+    try:
+        yield
+    except Exception:
+        elapsed = time.perf_counter() - start
+        stage_timings_s[name] = elapsed
+        logger.exception("Stage failed: %s (%.3f s)", name, elapsed)
+        raise
+    elapsed = time.perf_counter() - start
+    stage_timings_s[name] = elapsed
+    logger.info("Stage done: %s (%.3f s)", name, elapsed)
 
 
 def _prepare_output_dir(output_dir: Path) -> None:
@@ -212,17 +258,13 @@ def mesh_stl_to_tet4(config: PipelineConfig) -> Tuple[np.ndarray, np.ndarray, Di
     work_dir.mkdir(parents=True, exist_ok=True)
 
     mesher = config.mesher.lower().strip()
-    if mesher == "ftetwild":
-        mesher = "pytetwild"
-    if mesher not in {"auto", "gmsh", "tetgen", "pytetwild"}:
+    if mesher not in {"auto", "gmsh", "tetgen"}:
         raise ValueError(f"Unsupported mesher: {config.mesher}")
 
     fallback_mesher = None
     if config.fallback_mesher is not None:
         fallback_mesher = config.fallback_mesher.lower().strip()
-        if fallback_mesher == "ftetwild":
-            fallback_mesher = "pytetwild"
-        if fallback_mesher not in {"gmsh", "tetgen", "pytetwild"}:
+        if fallback_mesher not in {"gmsh", "tetgen"}:
             raise ValueError(f"Unsupported fallback mesher: {config.fallback_mesher}")
 
     if config.target_edge_size_m is not None and float(config.target_edge_size_m) <= 0.0:
@@ -247,13 +289,6 @@ def mesh_stl_to_tet4(config: PipelineConfig) -> Tuple[np.ndarray, np.ndarray, Di
         gmsh_size_min=(0.5 * edge_size) if edge_size is not None else None,
         gmsh_size_max=edge_size,
         tetgen_switches=_build_tetgen_switches(config),
-        ftetwild_ideal_edge_length=edge_size,
-        ftetwild_epsr=config.ftetwild_epsr,
-        ftetwild_stop_energy=config.ftetwild_stop_energy,
-        ftetwild_max_threads=config.ftetwild_max_threads,
-        ftetwild_quiet=not config.ftetwild_verbose,
-        ftetwild_coarsen=config.ftetwild_coarsen,
-        ftetwild_disable_filtering=config.ftetwild_disable_filtering,
     )
 
     tet_result = stl_to_tetmesh(
@@ -428,12 +463,23 @@ def apply_clamp_constraints(
 
 def _m_orthonormalize(eigenvectors: np.ndarray, M: scipy.sparse.csr_matrix) -> np.ndarray:
     ortho = np.asarray(eigenvectors, dtype=np.float64).copy()
-    for i in range(ortho.shape[1]):
-        vec = ortho[:, i]
-        norm_sq = float(vec @ (M @ vec))
-        if norm_sq > 0.0:
-            ortho[:, i] = vec / math.sqrt(norm_sq)
-    return ortho
+    if ortho.ndim != 2 or ortho.shape[1] == 0:
+        return ortho
+
+    gram = ortho.T @ (M @ ortho)
+    gram = 0.5 * (gram + gram.T)
+    evals, evecs = np.linalg.eigh(gram)
+    scale = max(float(np.max(np.abs(evals))) if evals.size else 0.0, 1.0)
+    keep = evals > (1.0e-12 * scale)
+    if not np.any(keep):
+        return np.zeros((ortho.shape[0], 0), dtype=np.float64)
+
+    reduced = ortho @ evecs[:, keep]
+    gram_reduced = reduced.T @ (M @ reduced)
+    gram_reduced = 0.5 * (gram_reduced + gram_reduced.T)
+    jitter = 1.0e-12 * max(float(np.max(np.abs(np.diag(gram_reduced)))) if gram_reduced.size else 1.0, 1.0)
+    chol = np.linalg.cholesky(gram_reduced + jitter * np.eye(gram_reduced.shape[0], dtype=np.float64))
+    return np.linalg.solve(chol, reduced.T).T
 
 
 def _symmetrically_scale_sparse(
@@ -637,6 +683,8 @@ def _solve_modes_jax_iterative(
     memory_fraction: float,
     shift_scale: float,
     has_constraints: bool,
+    initial_subspace: Optional[np.ndarray] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     try:
         from jax.experimental import sparse as jsparse  # type: ignore
@@ -671,6 +719,15 @@ def _solve_modes_jax_iterative(
         bytes_per=bytes_per,
         memory_fraction=memory_fraction,
     )
+    if progress_callback is not None:
+        avail_gib = (
+            f"{available_mem / (1024.0 ** 3):.2f} GiB" if available_mem is not None else "unknown"
+        )
+        progress_callback(
+            "jax-iterative setup: "
+            f"free_dofs={n}, requested_modes={num_modes}, solved_modes={k}, "
+            f"block_size={block_size}, dtype={dtype_txt}, available_memory={avail_gib}"
+        )
 
     K_diag_raw = np.asarray(K_free.diagonal(), dtype=np.float64)
     diag_floor = 1.0e-18 if dtype_txt == "float32" else 1.0e-30
@@ -681,6 +738,31 @@ def _solve_modes_jax_iterative(
     M_sp = _symmetrically_scale_sparse(M_free.astype(np_dtype, copy=False), scale.astype(np_dtype))
     K_bcoo = jsparse.BCOO.from_scipy_sparse(K_sp)
     M_bcoo = jsparse.BCOO.from_scipy_sparse(M_sp)
+    K_norm_est = float(np.max(np.asarray(np.abs(K_sp).sum(axis=1)).ravel()))
+    M_norm_est = float(np.max(np.asarray(np.abs(M_sp).sum(axis=1)).ravel()))
+    K_norm_est_jax = jnp.asarray(max(K_norm_est, 1.0e-30), dtype=jax_dtype)
+    M_norm_est_jax = jnp.asarray(max(M_norm_est, 1.0e-30), dtype=jax_dtype)
+
+    seeded_cols = 0
+    dynamic_block_cols = int(block_size)
+    seeded_basis_jax = None
+    if initial_subspace is not None:
+        seeded = np.asarray(initial_subspace, dtype=np.float64)
+        if seeded.ndim != 2 or seeded.shape[0] != n:
+            raise ValueError("initial_subspace must have shape (free_dofs, num_seed_vectors)")
+        if seeded.size > 0:
+            seeded_scaled = seeded / scale[:, None]
+            seeded_scaled = _m_orthonormalize(seeded_scaled, M_sp)
+            if seeded_scaled.shape[1] > 0:
+                seeded_scaled = seeded_scaled[:, : min(block_size, seeded_scaled.shape[1])]
+                seeded_cols = int(seeded_scaled.shape[1])
+                dynamic_block_cols = int(max(0, block_size - seeded_cols))
+                seeded_basis_jax = jnp.asarray(seeded_scaled.astype(np_dtype, copy=False), dtype=jax_dtype)
+                if progress_callback is not None:
+                    progress_callback(
+                        "jax-iterative initial subspace: "
+                        f"seeded_cols={seeded_cols}, dynamic_cols={dynamic_block_cols}"
+                    )
 
     M_diag = np.asarray(M_sp.diagonal(), dtype=np.float64)
     K_diag = np.asarray(K_sp.diagonal(), dtype=np.float64)
@@ -697,6 +779,11 @@ def _solve_modes_jax_iterative(
         shift = 0.0
     else:
         shift = max(1.0e-12, float(shift_scale) * eig_scale)
+    if progress_callback is not None:
+        progress_callback(
+            "jax-iterative spectral shift: "
+            f"eig_scale={eig_scale:.6g}, shift_scale={float(shift_scale):.6g}, shift={shift:.6g}"
+        )
 
     shift_jax = jnp.asarray(shift, dtype=jax_dtype)
     eps = jnp.asarray(1.0e-8 if dtype_txt == "float32" else 1.0e-12, dtype=jax_dtype)
@@ -709,6 +796,25 @@ def _solve_modes_jax_iterative(
 
     def jacobi_preconditioner(x):
         return inv_a_diag_jax * x
+
+    def project_out_seeded_jax(X):
+        if seeded_basis_jax is None:
+            return X
+        coeff = seeded_basis_jax.T @ (M_bcoo @ X)
+        return X - seeded_basis_jax @ coeff
+
+    def combine_with_seeded_jax(X):
+        if seeded_basis_jax is None:
+            return m_orthonormalize_jax(X)
+        if dynamic_block_cols <= 0:
+            return seeded_basis_jax[:, :block_size]
+
+        X_proj = project_out_seeded_jax(X)
+        X_proj = m_orthonormalize_jax(X_proj)
+        X_proj = X_proj[:, :dynamic_block_cols]
+        combined = jnp.concatenate([seeded_basis_jax, X_proj], axis=1)
+        combined = m_orthonormalize_jax(combined)
+        return combined[:, :block_size]
 
     def m_orthonormalize_jax(X):
         MX = M_bcoo @ X
@@ -747,11 +853,8 @@ def _solve_modes_jax_iterative(
         Mphi = M_bcoo @ evecs_k
         residual = Kphi - Mphi * evals_k[None, :]
         num = jnp.linalg.norm(residual, axis=0)
-        den = (
-            jnp.linalg.norm(Kphi, axis=0)
-            + jnp.abs(evals_k) * jnp.linalg.norm(Mphi, axis=0)
-            + eps
-        )
+        phi_norm = jnp.linalg.norm(evecs_k, axis=0)
+        den = (K_norm_est_jax + jnp.abs(evals_k) * M_norm_est_jax) * phi_norm + eps
         rel = num / den
         return rel
 
@@ -759,21 +862,33 @@ def _solve_modes_jax_iterative(
     generalized_ritz_jax = jax.jit(generalized_ritz_jax)
     residual_metrics_jax = jax.jit(residual_metrics_jax)
     cg_block = jax.jit(jax.vmap(cg_single, in_axes=1, out_axes=1))
+    project_out_seeded_jax = jax.jit(project_out_seeded_jax)
+    combine_with_seeded_jax = jax.jit(combine_with_seeded_jax)
 
     key = jax.random.PRNGKey(0)
-    X = jax.random.normal(key, (n, block_size), dtype=jax_dtype)
-    X = m_orthonormalize_jax(X)
+    if seeded_cols >= block_size and seeded_basis_jax is not None:
+        X = seeded_basis_jax[:, :block_size]
+    else:
+        random_cols = int(block_size - seeded_cols)
+        X_rand = jax.random.normal(key, (n, random_cols), dtype=jax_dtype)
+        X_rand = project_out_seeded_jax(X_rand)
+        X_rand = m_orthonormalize_jax(X_rand) if random_cols > 0 else X_rand
+        if seeded_basis_jax is not None and seeded_cols > 0:
+            X = jnp.concatenate([seeded_basis_jax, X_rand], axis=1)
+        else:
+            X = X_rand
+        X = m_orthonormalize_jax(X)
 
     residual_history: List[float] = []
     converged = False
     evals_k = None
     evecs_k = None
 
-    for _ in range(int(max_iters)):
+    for iter_idx in range(int(max_iters)):
         MX = M_bcoo @ X
         Y = cg_block(MX)
 
-        X = m_orthonormalize_jax(Y)
+        X = combine_with_seeded_jax(Y)
         evals_all, evecs_all = generalized_ritz_jax(X)
 
         order = jnp.argsort(evals_all)
@@ -785,11 +900,16 @@ def _solve_modes_jax_iterative(
         rel = residual_metrics_jax(evals_k, evecs_k)
         max_rel = float(np.max(np.asarray(rel, dtype=np.float64)))
         residual_history.append(max_rel)
+        if progress_callback is not None:
+            progress_callback(
+                "jax-iterative iteration "
+                f"{iter_idx + 1}/{int(max_iters)}: max_relative_residual={max_rel:.6e}"
+            )
         if max_rel <= float(tol):
             converged = True
             break
 
-        X = evecs_all[:, :block_size]
+        X = combine_with_seeded_jax(evecs_all[:, :block_size])
 
     if evals_k is None or evecs_k is None:
         raise RuntimeError("jax-iterative backend did not produce any Ritz vectors")
@@ -818,6 +938,7 @@ def _solve_modes_jax_iterative(
         "shift_scale": float(shift_scale),
         "shift_value": float(shift),
         "iter_memory_fraction": float(memory_fraction),
+        "seeded_initial_subspace_cols": int(seeded_cols),
         "available_memory_bytes": available_mem,
         "jax_default_backend": jax.default_backend(),
         "jax_device_count": int(len(jax.devices())),
@@ -841,6 +962,8 @@ def solve_generalized_modes(
     jax_iter_cg_tol: float = 1.0e-8,
     jax_iter_memory_fraction: float = 0.25,
     jax_iter_shift_scale: float = 1.0e-6,
+    initial_subspace: Optional[np.ndarray] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     n = K_free.shape[0]
     if n < 3:
@@ -876,6 +999,8 @@ def solve_generalized_modes(
             memory_fraction=float(jax_iter_memory_fraction),
             shift_scale=float(jax_iter_shift_scale),
             has_constraints=has_constraints,
+            initial_subspace=initial_subspace,
+            progress_callback=progress_callback,
         )
     raise ValueError(f"Unsupported solver backend: {solver_backend}")
 
@@ -994,6 +1119,28 @@ def _direction_vectors(
     dirs["ry"] = ry[free_dofs]
     dirs["rz"] = rz[free_dofs]
     return dirs
+
+
+def _rigid_body_initial_subspace(
+    points: np.ndarray,
+    free_dofs: np.ndarray,
+    vec: int,
+) -> np.ndarray:
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must have shape (num_nodes, 3)")
+    if vec != 3:
+        raise ValueError("rigid-body seeding is only implemented for 3D vector problems")
+
+    com_xyz = np.mean(points, axis=0, dtype=np.float64)
+    dirs = _direction_vectors(
+        points=points,
+        free_dofs=free_dofs,
+        vec=vec,
+        com_xyz=com_xyz,
+    )
+    ordered = ["x", "y", "z", "rx", "ry", "rz"]
+    basis = np.column_stack([dirs[key] for key in ordered]).astype(np.float64, copy=False)
+    return basis
 
 
 def _safe_div(num: float, den: float, default: float = 0.0) -> float:
@@ -1507,387 +1654,457 @@ def _csv_fieldnames() -> List[str]:
 
 
 def run_pipeline(config: PipelineConfig) -> Dict[str, str]:
+    prepare_start = time.perf_counter()
     _prepare_output_dir(config.output_dir)
-
-    points, cells, mesh_info = mesh_stl_to_tet4(config)
-
-    mesh = Mesh(points, cells, ele_type="TET4")
-
-    problem = LinearElasticModalProblem(
-        mesh,
-        vec=3,
-        dim=3,
-        ele_type="TET4",
-        dirichlet_bc_info=None,
-        additional_info=(
-            config.material.elastic_modulus_pa,
-            config.material.poissons_ratio,
-        ),
+    stage_timings_s: Dict[str, float] = {
+        "prepare_output_dir": time.perf_counter() - prepare_start,
+    }
+    logger, log_path = _create_run_logger(
+        config.output_dir,
+        verbose=bool(config.verbose or config.solver_verbose),
     )
-    fe = problem.fes[0]
-
-    K_full = assemble_stiffness(problem)
-    M_full = assemble_mass(fe, config.material.density_kg_m3)
-
-    K_free, M_free, free_dofs, clamped_nodes = apply_clamp_constraints(
-        K_full,
-        M_full,
-        points,
-        vec=fe.vec,
-        clamp_faces=config.clamp_faces,
-        clamp_components=config.clamp_components,
-        clamp_atol_m=config.clamp_atol_m,
-    )
-
-    eigenvalues, eigenvectors_free, freqs_hz, solver_meta = solve_generalized_modes(
-        K_free,
-        M_free,
-        num_modes=config.num_modes,
-        tol=config.eigsh_tolerance,
-        has_constraints=bool(config.clamp_faces),
-        solver_backend=config.solver_backend,
-        jax_max_dense_dofs=config.jax_dense_max_dofs,
-        jax_solver_dtype=config.jax_solver_dtype,
-        jax_iter_max_iters=config.jax_iter_max_iters,
-        jax_iter_tol=config.jax_iter_tol,
-        jax_iter_cg_max_iters=config.jax_iter_cg_max_iters,
-        jax_iter_cg_tol=config.jax_iter_cg_tol,
-        jax_iter_memory_fraction=config.jax_iter_memory_fraction,
-        jax_iter_shift_scale=config.jax_iter_shift_scale,
-    )
-
-    num_nodes = points.shape[0]
-    nodal_masses = _compute_nodal_masses(M_full, num_nodes=num_nodes, vec=fe.vec)
-    mass_props = _compute_mass_properties(points, nodal_masses)
-    bbox_dims = points.max(axis=0) - points.min(axis=0)
-    edge_stats = _edge_length_stats(points, cells)
-
-    dirs = _direction_vectors(
-        points=points,
-        free_dofs=free_dofs,
-        vec=fe.vec,
-        com_xyz=np.array(
-            [
-                mass_props["center_of_mass_x_m"],
-                mass_props["center_of_mass_y_m"],
-                mass_props["center_of_mass_z_m"],
-            ],
-            dtype=np.float64,
+    logger.info("Modal pipeline initialized")
+    logger.info("Input STL: %s", config.stl_path)
+    logger.info("Output dir: %s", config.output_dir)
+    logger.info(
+        "Configuration: modes=%d mesher=%s solver=%s scale=%.6g target_edge=%s",
+        int(config.num_modes),
+        config.mesher,
+        config.solver_backend,
+        float(config.stl_length_scale),
+        (
+            f"{float(config.target_edge_size_m):.6g} m"
+            if config.target_edge_size_m is not None
+            else "auto"
         ),
     )
 
-    total_mass = float(mass_props["total_mass_kg"])
+    with _timed_stage(logger, stage_timings_s, "mesh_stl_to_tet4"):
+        points, cells, mesh_info = mesh_stl_to_tet4(config)
+    logger.info(
+        "Meshing complete: mesher=%s nodes=%d elements=%d bbox=%s",
+        mesh_info["mesher_used"],
+        int(points.shape[0]),
+        int(cells.shape[0]),
+        [float(v) for v in mesh_info["bbox_size"]],
+    )
 
-    run_timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-    mode_rows: List[Dict[str, Any]] = []
-
-    for mode_idx, (lam, freq, phi_free) in enumerate(
-        zip(eigenvalues, freqs_hz, eigenvectors_free.T),
-        start=1,
-    ):
-        phi_free = np.asarray(phi_free, dtype=np.float64)
-        modal_mass = float(phi_free @ (M_free @ phi_free))
-        modal_stiffness = float(phi_free @ (K_free @ phi_free))
-
-        pf: Dict[str, float] = {}
-        eff: Dict[str, float] = {}
-        for key, r_free in dirs.items():
-            gen_force = float(phi_free @ (M_free @ r_free))
-            if modal_mass > 0.0:
-                pf[key] = gen_force / modal_mass
-                eff[key] = (gen_force**2) / modal_mass
-            else:
-                pf[key] = 0.0
-                eff[key] = 0.0
-
-        if abs(config.rayleigh_alpha) > 0.0 or abs(config.rayleigh_beta) > 0.0:
-            modal_damping = (
-                config.rayleigh_alpha * modal_mass
-                + config.rayleigh_beta * modal_stiffness
-            )
-            damping_ratio = _safe_div(
-                modal_damping,
-                2.0 * math.sqrt(max(modal_mass * modal_stiffness, 0.0)),
-                default=math.nan,
-            )
-        elif config.damping_ratio is not None:
-            damping_ratio = float(config.damping_ratio)
-            modal_damping = 2.0 * damping_ratio * math.sqrt(
-                max(modal_mass * modal_stiffness, 0.0)
-            )
-        else:
-            damping_ratio = math.nan
-            modal_damping = math.nan
-
-        full_dofs = _full_mode_dofs(phi_free, free_dofs, fe.num_total_dofs)
-        mode_shape = full_dofs.reshape((num_nodes, fe.vec))
-        disp_mag = np.linalg.norm(mode_shape, axis=1)
-
-        peak_node = int(np.argmax(disp_mag))
-        max_disp = float(disp_mag[peak_node])
-        rms_disp = float(np.sqrt(np.mean(disp_mag**2)))
-
-        nodal_line_threshold = float(config.nodal_line_fraction * max_disp)
-        nodal_lines = np.where(disp_mag <= nodal_line_threshold)[0]
-
-        Ku = K_full @ full_dofs
-        dof_energy = 0.5 * full_dofs * Ku
-        nodal_energy = np.maximum(dof_energy.reshape(num_nodes, fe.vec).sum(axis=1), 0.0)
-        total_strain_energy = float(np.sum(nodal_energy))
-        nodal_energy_frac = (
-            nodal_energy / total_strain_energy if total_strain_energy > 0.0 else np.zeros_like(nodal_energy)
+    with _timed_stage(logger, stage_timings_s, "build_problem"):
+        mesh = Mesh(points, cells, ele_type="TET4")
+        problem = LinearElasticModalProblem(
+            mesh,
+            vec=3,
+            dim=3,
+            ele_type="TET4",
+            dirichlet_bc_info=None,
+            additional_info=(
+                config.material.elastic_modulus_pa,
+                config.material.poissons_ratio,
+            ),
         )
+        fe = problem.fes[0]
 
-        x_mid, y_mid, z_mid = (points.min(axis=0) + points.max(axis=0)) * 0.5
-        if total_strain_energy > 0.0:
-            ex_low = float(nodal_energy[points[:, 0] <= x_mid].sum() / total_strain_energy)
-            ex_high = float(nodal_energy[points[:, 0] > x_mid].sum() / total_strain_energy)
-            ey_low = float(nodal_energy[points[:, 1] <= y_mid].sum() / total_strain_energy)
-            ey_high = float(nodal_energy[points[:, 1] > y_mid].sum() / total_strain_energy)
-            ez_low = float(nodal_energy[points[:, 2] <= z_mid].sum() / total_strain_energy)
-            ez_high = float(nodal_energy[points[:, 2] > z_mid].sum() / total_strain_energy)
-        else:
-            ex_low = ex_high = ey_low = ey_high = ez_low = ez_high = 0.0
+    with _timed_stage(logger, stage_timings_s, "assemble_stiffness"):
+        K_full = assemble_stiffness(problem)
+    logger.info("Stiffness matrix assembled: shape=%s nnz=%d", K_full.shape, int(K_full.nnz))
 
-        aux = _save_mode_aux_files(
-            output_dir=config.output_dir,
-            mode_idx=mode_idx,
+    with _timed_stage(logger, stage_timings_s, "assemble_mass"):
+        M_full = assemble_mass(fe, config.material.density_kg_m3)
+    logger.info("Mass matrix assembled: shape=%s nnz=%d", M_full.shape, int(M_full.nnz))
+
+    with _timed_stage(logger, stage_timings_s, "apply_constraints"):
+        K_free, M_free, free_dofs, clamped_nodes = apply_clamp_constraints(
+            K_full,
+            M_full,
+            points,
+            vec=fe.vec,
+            clamp_faces=config.clamp_faces,
+            clamp_components=config.clamp_components,
+            clamp_atol_m=config.clamp_atol_m,
+        )
+    logger.info(
+        "Constraint reduction: clamped_nodes=%d free_dofs=%d",
+        int(clamped_nodes.size),
+        int(K_free.shape[0]),
+    )
+
+    initial_subspace = None
+    if config.solver_backend.strip().lower() == "jax-iterative" and not config.clamp_faces:
+        initial_subspace = _rigid_body_initial_subspace(
             points=points,
-            mode_shape=mode_shape,
-            disp_mag=disp_mag,
-            nodal_lines=nodal_lines,
-            nodal_energy=nodal_energy,
-            nodal_energy_frac=nodal_energy_frac,
+            free_dofs=free_dofs,
+            vec=fe.vec,
         )
-        animation_paths = {
-            "paraview_animation_case_dir": "not_exported",
-            "paraview_animation_pvd_path": "not_exported",
-            "paraview_animation_peak_displacement_m": math.nan,
-            "paraview_animation_amplitude_scale": math.nan,
-        }
-        if config.export_mode_animations:
-            animation_paths = _save_mode_animation_files(
-                output_dir=config.output_dir,
-                fe=fe,
-                mode_idx=mode_idx,
-                mode_shape=mode_shape,
-                max_disp=max_disp,
-                bbox_dims=bbox_dims,
-                num_frames=config.mode_animation_frames,
-                cycles=config.mode_animation_cycles,
-                peak_fraction=config.mode_animation_peak_fraction,
+        logger.info(
+            "Initialized free-free rigid-body seed basis: cols=%d",
+            int(initial_subspace.shape[1]),
+        )
+
+    solve_progress = logger.info if config.solver_verbose else None
+    with _timed_stage(logger, stage_timings_s, "solve_generalized_modes"):
+        eigenvalues, eigenvectors_free, freqs_hz, solver_meta = solve_generalized_modes(
+            K_free,
+            M_free,
+            num_modes=config.num_modes,
+            tol=config.eigsh_tolerance,
+            has_constraints=bool(config.clamp_faces),
+            solver_backend=config.solver_backend,
+            jax_max_dense_dofs=config.jax_dense_max_dofs,
+            jax_solver_dtype=config.jax_solver_dtype,
+            jax_iter_max_iters=config.jax_iter_max_iters,
+            jax_iter_tol=config.jax_iter_tol,
+            jax_iter_cg_max_iters=config.jax_iter_cg_max_iters,
+            jax_iter_cg_tol=config.jax_iter_cg_tol,
+            jax_iter_memory_fraction=config.jax_iter_memory_fraction,
+            jax_iter_shift_scale=config.jax_iter_shift_scale,
+            initial_subspace=initial_subspace,
+            progress_callback=solve_progress,
+        )
+    logger.info(
+        "Modal solve complete: backend=%s method=%s solved_modes=%d freq_range=[%.6g, %.6g] Hz",
+        solver_meta.get("solver_backend"),
+        solver_meta.get("solver_method"),
+        int(freqs_hz.size),
+        float(np.min(freqs_hz)) if freqs_hz.size else math.nan,
+        float(np.max(freqs_hz)) if freqs_hz.size else math.nan,
+    )
+
+    with _timed_stage(logger, stage_timings_s, "postprocess_and_export"):
+        num_nodes = points.shape[0]
+        nodal_masses = _compute_nodal_masses(M_full, num_nodes=num_nodes, vec=fe.vec)
+        mass_props = _compute_mass_properties(points, nodal_masses)
+        bbox_dims = points.max(axis=0) - points.min(axis=0)
+        edge_stats = _edge_length_stats(points, cells)
+
+        dirs = _direction_vectors(
+            points=points,
+            free_dofs=free_dofs,
+            vec=fe.vec,
+            com_xyz=np.array(
+                [
+                    mass_props["center_of_mass_x_m"],
+                    mass_props["center_of_mass_y_m"],
+                    mass_props["center_of_mass_z_m"],
+                ],
+                dtype=np.float64,
+            ),
+        )
+
+        total_mass = float(mass_props["total_mass_kg"])
+        run_timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        mode_rows: List[Dict[str, Any]] = []
+
+        for mode_idx, (lam, freq, phi_free) in enumerate(
+            zip(eigenvalues, freqs_hz, eigenvectors_free.T),
+            start=1,
+        ):
+            phi_free = np.asarray(phi_free, dtype=np.float64)
+            modal_mass = float(phi_free @ (M_free @ phi_free))
+            modal_stiffness = float(phi_free @ (K_free @ phi_free))
+
+            pf: Dict[str, float] = {}
+            eff: Dict[str, float] = {}
+            for key, r_free in dirs.items():
+                gen_force = float(phi_free @ (M_free @ r_free))
+                if modal_mass > 0.0:
+                    pf[key] = gen_force / modal_mass
+                    eff[key] = (gen_force**2) / modal_mass
+                else:
+                    pf[key] = 0.0
+                    eff[key] = 0.0
+
+            if abs(config.rayleigh_alpha) > 0.0 or abs(config.rayleigh_beta) > 0.0:
+                modal_damping = (
+                    config.rayleigh_alpha * modal_mass
+                    + config.rayleigh_beta * modal_stiffness
+                )
+                damping_ratio = _safe_div(
+                    modal_damping,
+                    2.0 * math.sqrt(max(modal_mass * modal_stiffness, 0.0)),
+                    default=math.nan,
+                )
+            elif config.damping_ratio is not None:
+                damping_ratio = float(config.damping_ratio)
+                modal_damping = 2.0 * damping_ratio * math.sqrt(
+                    max(modal_mass * modal_stiffness, 0.0)
+                )
+            else:
+                damping_ratio = math.nan
+                modal_damping = math.nan
+
+            full_dofs = _full_mode_dofs(phi_free, free_dofs, fe.num_total_dofs)
+            mode_shape = full_dofs.reshape((num_nodes, fe.vec))
+            disp_mag = np.linalg.norm(mode_shape, axis=1)
+
+            peak_node = int(np.argmax(disp_mag))
+            max_disp = float(disp_mag[peak_node])
+            rms_disp = float(np.sqrt(np.mean(disp_mag**2)))
+            nodal_line_threshold = float(config.nodal_line_fraction * max_disp)
+            nodal_lines = np.where(disp_mag <= nodal_line_threshold)[0]
+
+            Ku = K_full @ full_dofs
+            dof_energy = 0.5 * full_dofs * Ku
+            nodal_energy = np.maximum(dof_energy.reshape(num_nodes, fe.vec).sum(axis=1), 0.0)
+            total_strain_energy = float(np.sum(nodal_energy))
+            nodal_energy_frac = (
+                nodal_energy / total_strain_energy if total_strain_energy > 0.0 else np.zeros_like(nodal_energy)
             )
 
-        row = {
+            x_mid, y_mid, z_mid = (points.min(axis=0) + points.max(axis=0)) * 0.5
+            if total_strain_energy > 0.0:
+                ex_low = float(nodal_energy[points[:, 0] <= x_mid].sum() / total_strain_energy)
+                ex_high = float(nodal_energy[points[:, 0] > x_mid].sum() / total_strain_energy)
+                ey_low = float(nodal_energy[points[:, 1] <= y_mid].sum() / total_strain_energy)
+                ey_high = float(nodal_energy[points[:, 1] > y_mid].sum() / total_strain_energy)
+                ez_low = float(nodal_energy[points[:, 2] <= z_mid].sum() / total_strain_energy)
+                ez_high = float(nodal_energy[points[:, 2] > z_mid].sum() / total_strain_energy)
+            else:
+                ex_low = ex_high = ey_low = ey_high = ez_low = ez_high = 0.0
+
+            aux = _save_mode_aux_files(
+                output_dir=config.output_dir,
+                mode_idx=mode_idx,
+                points=points,
+                mode_shape=mode_shape,
+                disp_mag=disp_mag,
+                nodal_lines=nodal_lines,
+                nodal_energy=nodal_energy,
+                nodal_energy_frac=nodal_energy_frac,
+            )
+            animation_paths = {
+                "paraview_animation_case_dir": "not_exported",
+                "paraview_animation_pvd_path": "not_exported",
+                "paraview_animation_peak_displacement_m": math.nan,
+                "paraview_animation_amplitude_scale": math.nan,
+            }
+            if config.export_mode_animations:
+                animation_paths = _save_mode_animation_files(
+                    output_dir=config.output_dir,
+                    fe=fe,
+                    mode_idx=mode_idx,
+                    mode_shape=mode_shape,
+                    max_disp=max_disp,
+                    bbox_dims=bbox_dims,
+                    num_frames=config.mode_animation_frames,
+                    cycles=config.mode_animation_cycles,
+                    peak_fraction=config.mode_animation_peak_fraction,
+                )
+
+            row = {
+                "run_timestamp_utc": run_timestamp,
+                "input_stl": str(config.stl_path),
+                "mode_number": mode_idx,
+                "natural_frequency_hz": float(freq),
+                "angular_frequency_rad_s": float(2.0 * np.pi * freq),
+                "period_s": (1.0 / float(freq)) if freq > 0.0 else math.nan,
+                "eigenvalue_rad2_s2": float(lam),
+                "modal_mass_kg": modal_mass,
+                "modal_stiffness_n_m": modal_stiffness,
+                "modal_damping_n_s_m": float(modal_damping),
+                "damping_ratio": float(damping_ratio),
+                "participation_factor_x": pf["x"],
+                "participation_factor_y": pf["y"],
+                "participation_factor_z": pf["z"],
+                "participation_factor_rx": pf["rx"],
+                "participation_factor_ry": pf["ry"],
+                "participation_factor_rz": pf["rz"],
+                "effective_modal_mass_x_kg": eff["x"],
+                "effective_modal_mass_y_kg": eff["y"],
+                "effective_modal_mass_z_kg": eff["z"],
+                "effective_modal_mass_fraction_x": _safe_div(eff["x"], total_mass, 0.0),
+                "effective_modal_mass_fraction_y": _safe_div(eff["y"], total_mass, 0.0),
+                "effective_modal_mass_fraction_z": _safe_div(eff["z"], total_mass, 0.0),
+                "cumulative_effective_mass_fraction_x": 0.0,
+                "cumulative_effective_mass_fraction_y": 0.0,
+                "cumulative_effective_mass_fraction_z": 0.0,
+                "mass_participation_ratio_x": 0.0,
+                "mass_participation_ratio_y": 0.0,
+                "mass_participation_ratio_z": 0.0,
+                "nodal_displacement_eigenvector_path": aux["mode_shape_path"],
+                "rotational_dof_eigenvector_path": "N/A (solid displacement-only DOFs)",
+                "max_modal_displacement_m": max_disp,
+                "rms_modal_displacement_m": rms_disp,
+                "mode_shape_normalization": "M-orthonormalized eigenvector",
+                "peak_displacement_node_id": peak_node,
+                "peak_displacement_x_m": float(points[peak_node, 0]),
+                "peak_displacement_y_m": float(points[peak_node, 1]),
+                "peak_displacement_z_m": float(points[peak_node, 2]),
+                "nodal_line_threshold_m": nodal_line_threshold,
+                "nodal_line_node_count": int(nodal_lines.size),
+                "nodal_line_node_fraction": _safe_div(float(nodal_lines.size), float(num_nodes), 0.0),
+                "nodal_line_nodes_path": aux["nodal_line_path"],
+                "modal_strain_energy_distribution_path": aux["energy_distribution_path"],
+                "paraview_animation_case_dir": animation_paths["paraview_animation_case_dir"],
+                "paraview_animation_pvd_path": animation_paths["paraview_animation_pvd_path"],
+                "paraview_animation_peak_displacement_m": animation_paths["paraview_animation_peak_displacement_m"],
+                "paraview_animation_amplitude_scale": animation_paths["paraview_animation_amplitude_scale"],
+                "modal_strain_energy_total_j": total_strain_energy,
+                "strain_energy_fraction_x_low": ex_low,
+                "strain_energy_fraction_x_high": ex_high,
+                "strain_energy_fraction_y_low": ey_low,
+                "strain_energy_fraction_y_high": ey_high,
+                "strain_energy_fraction_z_low": ez_low,
+                "strain_energy_fraction_z_high": ez_high,
+                "dominant_deformation_character": _deformation_character(
+                    eff_x=eff["x"],
+                    eff_y=eff["y"],
+                    eff_z=eff["z"],
+                    pf_rx=pf["rx"],
+                    pf_ry=pf["ry"],
+                    pf_rz=pf["rz"],
+                    bbox_dims=bbox_dims,
+                ),
+                "total_mass_kg": mass_props["total_mass_kg"],
+                "center_of_mass_x_m": mass_props["center_of_mass_x_m"],
+                "center_of_mass_y_m": mass_props["center_of_mass_y_m"],
+                "center_of_mass_z_m": mass_props["center_of_mass_z_m"],
+                "inertia_xx_kg_m2": mass_props["inertia_xx_kg_m2"],
+                "inertia_yy_kg_m2": mass_props["inertia_yy_kg_m2"],
+                "inertia_zz_kg_m2": mass_props["inertia_zz_kg_m2"],
+                "inertia_xy_kg_m2": mass_props["inertia_xy_kg_m2"],
+                "inertia_xz_kg_m2": mass_props["inertia_xz_kg_m2"],
+                "inertia_yz_kg_m2": mass_props["inertia_yz_kg_m2"],
+                "bounding_box_x_m": float(bbox_dims[0]),
+                "bounding_box_y_m": float(bbox_dims[1]),
+                "bounding_box_z_m": float(bbox_dims[2]),
+                "material_density_kg_m3": float(config.material.density_kg_m3),
+                "material_elastic_modulus_pa": float(config.material.elastic_modulus_pa),
+                "material_poissons_ratio": float(config.material.poissons_ratio),
+                "material_anisotropic_constants": config.material.anisotropic_constants,
+                "boundary_conditions": (
+                    "free-free"
+                    if len(config.clamp_faces) == 0
+                    else f"clamped faces={list(config.clamp_faces)}, components={list(config.clamp_components)}"
+                ),
+                "contact_assumptions": config.contact_assumptions,
+                "mesh_target_size_m": config.target_edge_size_m,
+                "mesh_mean_edge_size_m": edge_stats["mesh_mean_edge_size_m"],
+                "mesh_min_edge_size_m": edge_stats["mesh_min_edge_size_m"],
+                "mesh_max_edge_size_m": edge_stats["mesh_max_edge_size_m"],
+                "mesh_element_count": int(cells.shape[0]),
+                "mesh_node_count": int(points.shape[0]),
+                "mesh_element_type": "TET4",
+                "solver_settings": json.dumps(solver_meta, sort_keys=True),
+                "frequency_extraction_min_hz": float(np.min(freqs_hz)) if freqs_hz.size else math.nan,
+                "frequency_extraction_max_hz": float(np.max(freqs_hz)) if freqs_hz.size else math.nan,
+                "number_of_modes_extracted": int(freqs_hz.size),
+                "cumulative_mass_participation_by_mode_count_x": "",
+                "cumulative_mass_participation_by_mode_count_y": "",
+                "cumulative_mass_participation_by_mode_count_z": "",
+                "residual_mass_fraction_x": 0.0,
+                "residual_mass_fraction_y": 0.0,
+                "residual_mass_fraction_z": 0.0,
+                "mesh_convergence_indicator": "not_evaluated_single_mesh",
+                "orthogonality_max_offdiag_mass": 0.0,
+                "orthogonality_max_offdiag_stiffness": 0.0,
+                "mac_max_offdiag": 0.0,
+                "rigid_body_modes_detected": "",
+                "repeated_mode_groups": "",
+                "boundary_condition_sensitivity": "not_evaluated",
+                "mesh_density_sensitivity": "not_evaluated",
+                "material_uncertainty_sensitivity": _material_uncertainty_summary(
+                    config.material_uncertainty_pct
+                ),
+                "mesher_used": mesh_info["mesher_used"],
+            }
+            mode_rows.append(row)
+
+        if not mode_rows:
+            raise RuntimeError("No modes extracted")
+
+        eff_x = np.array([r["effective_modal_mass_x_kg"] for r in mode_rows], dtype=np.float64)
+        eff_y = np.array([r["effective_modal_mass_y_kg"] for r in mode_rows], dtype=np.float64)
+        eff_z = np.array([r["effective_modal_mass_z_kg"] for r in mode_rows], dtype=np.float64)
+
+        cum_x = np.cumsum(eff_x) / total_mass if total_mass > 0.0 else np.zeros_like(eff_x)
+        cum_y = np.cumsum(eff_y) / total_mass if total_mass > 0.0 else np.zeros_like(eff_y)
+        cum_z = np.cumsum(eff_z) / total_mass if total_mass > 0.0 else np.zeros_like(eff_z)
+
+        sum_x = float(np.sum(eff_x))
+        sum_y = float(np.sum(eff_y))
+        sum_z = float(np.sum(eff_z))
+
+        Phi = np.asarray(eigenvectors_free, dtype=np.float64)
+        mass_modal_matrix = Phi.T @ (M_free @ Phi)
+        stiff_modal_matrix = Phi.T @ (K_free @ Phi)
+
+        ortho_mass = _max_normalized_offdiag(mass_modal_matrix)
+        ortho_stiff = _max_normalized_offdiag(stiff_modal_matrix)
+
+        mac = _mac_matrix(mass_modal_matrix)
+        mac_offdiag = mac.copy()
+        np.fill_diagonal(mac_offdiag, 0.0)
+        mac_max_offdiag = float(np.max(mac_offdiag)) if mac_offdiag.size else 0.0
+
+        rigid_mode_indices = [
+            int(i + 1)
+            for i, f in enumerate(freqs_hz)
+            if float(f) < float(config.rigid_mode_cutoff_hz)
+        ]
+        repeated_groups = _detect_repeated_modes(freqs_hz, config.degenerate_mode_rel_tol)
+
+        for i, row in enumerate(mode_rows):
+            row["cumulative_effective_mass_fraction_x"] = float(cum_x[i])
+            row["cumulative_effective_mass_fraction_y"] = float(cum_y[i])
+            row["cumulative_effective_mass_fraction_z"] = float(cum_z[i])
+            row["mass_participation_ratio_x"] = _safe_div(eff_x[i], sum_x, 0.0)
+            row["mass_participation_ratio_y"] = _safe_div(eff_y[i], sum_y, 0.0)
+            row["mass_participation_ratio_z"] = _safe_div(eff_z[i], sum_z, 0.0)
+            row["cumulative_mass_participation_by_mode_count_x"] = _serialize_cumulative(cum_x)
+            row["cumulative_mass_participation_by_mode_count_y"] = _serialize_cumulative(cum_y)
+            row["cumulative_mass_participation_by_mode_count_z"] = _serialize_cumulative(cum_z)
+            row["residual_mass_fraction_x"] = float(max(0.0, 1.0 - cum_x[-1]))
+            row["residual_mass_fraction_y"] = float(max(0.0, 1.0 - cum_y[-1]))
+            row["residual_mass_fraction_z"] = float(max(0.0, 1.0 - cum_z[-1]))
+            row["orthogonality_max_offdiag_mass"] = ortho_mass
+            row["orthogonality_max_offdiag_stiffness"] = ortho_stiff
+            row["mac_max_offdiag"] = mac_max_offdiag
+            row["rigid_body_modes_detected"] = json.dumps(rigid_mode_indices)
+            row["repeated_mode_groups"] = json.dumps(repeated_groups)
+
+        csv_path = config.output_dir / "modal_comprehensive_report.csv"
+        fieldnames = _csv_fieldnames()
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in mode_rows:
+                writer.writerow(row)
+
+        matrices_dir = config.output_dir / "matrices"
+        matrices_dir.mkdir(parents=True, exist_ok=True)
+        _save_matrix_csv(matrices_dir / "mass_orthogonality_matrix.csv", mass_modal_matrix)
+        _save_matrix_csv(matrices_dir / "stiffness_modal_matrix.csv", stiff_modal_matrix)
+        _save_matrix_csv(matrices_dir / "mac_matrix.csv", mac)
+
+        run_summary = {
             "run_timestamp_utc": run_timestamp,
             "input_stl": str(config.stl_path),
-            "mode_number": mode_idx,
-            "natural_frequency_hz": float(freq),
-            "angular_frequency_rad_s": float(2.0 * np.pi * freq),
-            "period_s": (1.0 / float(freq)) if freq > 0.0 else math.nan,
-            "eigenvalue_rad2_s2": float(lam),
-            "modal_mass_kg": modal_mass,
-            "modal_stiffness_n_m": modal_stiffness,
-            "modal_damping_n_s_m": float(modal_damping),
-            "damping_ratio": float(damping_ratio),
-            "participation_factor_x": pf["x"],
-            "participation_factor_y": pf["y"],
-            "participation_factor_z": pf["z"],
-            "participation_factor_rx": pf["rx"],
-            "participation_factor_ry": pf["ry"],
-            "participation_factor_rz": pf["rz"],
-            "effective_modal_mass_x_kg": eff["x"],
-            "effective_modal_mass_y_kg": eff["y"],
-            "effective_modal_mass_z_kg": eff["z"],
-            "effective_modal_mass_fraction_x": _safe_div(eff["x"], total_mass, 0.0),
-            "effective_modal_mass_fraction_y": _safe_div(eff["y"], total_mass, 0.0),
-            "effective_modal_mass_fraction_z": _safe_div(eff["z"], total_mass, 0.0),
-            "cumulative_effective_mass_fraction_x": 0.0,
-            "cumulative_effective_mass_fraction_y": 0.0,
-            "cumulative_effective_mass_fraction_z": 0.0,
-            "mass_participation_ratio_x": 0.0,
-            "mass_participation_ratio_y": 0.0,
-            "mass_participation_ratio_z": 0.0,
-            "nodal_displacement_eigenvector_path": aux["mode_shape_path"],
-            "rotational_dof_eigenvector_path": "N/A (solid displacement-only DOFs)",
-            "max_modal_displacement_m": max_disp,
-            "rms_modal_displacement_m": rms_disp,
-            "mode_shape_normalization": "M-orthonormalized eigenvector",
-            "peak_displacement_node_id": peak_node,
-            "peak_displacement_x_m": float(points[peak_node, 0]),
-            "peak_displacement_y_m": float(points[peak_node, 1]),
-            "peak_displacement_z_m": float(points[peak_node, 2]),
-            "nodal_line_threshold_m": nodal_line_threshold,
-            "nodal_line_node_count": int(nodal_lines.size),
-            "nodal_line_node_fraction": _safe_div(float(nodal_lines.size), float(num_nodes), 0.0),
-            "nodal_line_nodes_path": aux["nodal_line_path"],
-            "modal_strain_energy_distribution_path": aux["energy_distribution_path"],
-            "paraview_animation_case_dir": animation_paths["paraview_animation_case_dir"],
-            "paraview_animation_pvd_path": animation_paths["paraview_animation_pvd_path"],
-            "paraview_animation_peak_displacement_m": animation_paths["paraview_animation_peak_displacement_m"],
-            "paraview_animation_amplitude_scale": animation_paths["paraview_animation_amplitude_scale"],
-            "modal_strain_energy_total_j": total_strain_energy,
-            "strain_energy_fraction_x_low": ex_low,
-            "strain_energy_fraction_x_high": ex_high,
-            "strain_energy_fraction_y_low": ey_low,
-            "strain_energy_fraction_y_high": ey_high,
-            "strain_energy_fraction_z_low": ez_low,
-            "strain_energy_fraction_z_high": ez_high,
-            "dominant_deformation_character": _deformation_character(
-                eff_x=eff["x"],
-                eff_y=eff["y"],
-                eff_z=eff["z"],
-                pf_rx=pf["rx"],
-                pf_ry=pf["ry"],
-                pf_rz=pf["rz"],
-                bbox_dims=bbox_dims,
-            ),
-            "total_mass_kg": mass_props["total_mass_kg"],
-            "center_of_mass_x_m": mass_props["center_of_mass_x_m"],
-            "center_of_mass_y_m": mass_props["center_of_mass_y_m"],
-            "center_of_mass_z_m": mass_props["center_of_mass_z_m"],
-            "inertia_xx_kg_m2": mass_props["inertia_xx_kg_m2"],
-            "inertia_yy_kg_m2": mass_props["inertia_yy_kg_m2"],
-            "inertia_zz_kg_m2": mass_props["inertia_zz_kg_m2"],
-            "inertia_xy_kg_m2": mass_props["inertia_xy_kg_m2"],
-            "inertia_xz_kg_m2": mass_props["inertia_xz_kg_m2"],
-            "inertia_yz_kg_m2": mass_props["inertia_yz_kg_m2"],
-            "bounding_box_x_m": float(bbox_dims[0]),
-            "bounding_box_y_m": float(bbox_dims[1]),
-            "bounding_box_z_m": float(bbox_dims[2]),
-            "material_density_kg_m3": float(config.material.density_kg_m3),
-            "material_elastic_modulus_pa": float(config.material.elastic_modulus_pa),
-            "material_poissons_ratio": float(config.material.poissons_ratio),
-            "material_anisotropic_constants": config.material.anisotropic_constants,
-            "boundary_conditions": (
-                "free-free"
-                if len(config.clamp_faces) == 0
-                else f"clamped faces={list(config.clamp_faces)}, components={list(config.clamp_components)}"
-            ),
-            "contact_assumptions": config.contact_assumptions,
-            "mesh_target_size_m": config.target_edge_size_m,
-            "mesh_mean_edge_size_m": edge_stats["mesh_mean_edge_size_m"],
-            "mesh_min_edge_size_m": edge_stats["mesh_min_edge_size_m"],
-            "mesh_max_edge_size_m": edge_stats["mesh_max_edge_size_m"],
+            "mesher_used": mesh_info["mesher_used"],
+            "solver_backend": solver_meta.get("solver_backend"),
+            "solver_method": solver_meta.get("solver_method"),
+            "solver_converged": solver_meta.get("converged"),
+            "solver_iterations_run": solver_meta.get("iterations_run"),
+            "solver_residual_max_last": solver_meta.get("residual_max_last"),
+            "solver_residual_tolerance": solver_meta.get("residual_tolerance"),
             "mesh_element_count": int(cells.shape[0]),
             "mesh_node_count": int(points.shape[0]),
-            "mesh_element_type": "TET4",
-            "solver_settings": json.dumps(solver_meta, sort_keys=True),
-            "frequency_extraction_min_hz": float(np.min(freqs_hz)) if freqs_hz.size else math.nan,
-            "frequency_extraction_max_hz": float(np.max(freqs_hz)) if freqs_hz.size else math.nan,
-            "number_of_modes_extracted": int(freqs_hz.size),
-            "cumulative_mass_participation_by_mode_count_x": "",
-            "cumulative_mass_participation_by_mode_count_y": "",
-            "cumulative_mass_participation_by_mode_count_z": "",
-            "residual_mass_fraction_x": 0.0,
-            "residual_mass_fraction_y": 0.0,
-            "residual_mass_fraction_z": 0.0,
-            "mesh_convergence_indicator": "not_evaluated_single_mesh",
-            "orthogonality_max_offdiag_mass": 0.0,
-            "orthogonality_max_offdiag_stiffness": 0.0,
-            "mac_max_offdiag": 0.0,
-            "rigid_body_modes_detected": "",
-            "repeated_mode_groups": "",
-            "boundary_condition_sensitivity": "not_evaluated",
-            "mesh_density_sensitivity": "not_evaluated",
-            "material_uncertainty_sensitivity": _material_uncertainty_summary(
-                config.material_uncertainty_pct
-            ),
-            "mesher_used": mesh_info["mesher_used"],
+            "clamped_node_count": int(clamped_nodes.size),
+            "free_dof_count": int(K_free.shape[0]),
+            "mode_count": int(len(mode_rows)),
+            "mode_animation_exported": bool(config.export_mode_animations),
+            "csv_path": str(csv_path),
+            "log_path": str(log_path),
+            "stage_timings_s": {},
         }
-        mode_rows.append(row)
 
-    if not mode_rows:
-        raise RuntimeError("No modes extracted")
-
-    eff_x = np.array([r["effective_modal_mass_x_kg"] for r in mode_rows], dtype=np.float64)
-    eff_y = np.array([r["effective_modal_mass_y_kg"] for r in mode_rows], dtype=np.float64)
-    eff_z = np.array([r["effective_modal_mass_z_kg"] for r in mode_rows], dtype=np.float64)
-
-    cum_x = np.cumsum(eff_x) / total_mass if total_mass > 0.0 else np.zeros_like(eff_x)
-    cum_y = np.cumsum(eff_y) / total_mass if total_mass > 0.0 else np.zeros_like(eff_y)
-    cum_z = np.cumsum(eff_z) / total_mass if total_mass > 0.0 else np.zeros_like(eff_z)
-
-    sum_x = float(np.sum(eff_x))
-    sum_y = float(np.sum(eff_y))
-    sum_z = float(np.sum(eff_z))
-
-    Phi = np.asarray(eigenvectors_free, dtype=np.float64)
-    mass_modal_matrix = Phi.T @ (M_free @ Phi)
-    stiff_modal_matrix = Phi.T @ (K_free @ Phi)
-
-    ortho_mass = _max_normalized_offdiag(mass_modal_matrix)
-    ortho_stiff = _max_normalized_offdiag(stiff_modal_matrix)
-
-    mac = _mac_matrix(mass_modal_matrix)
-    mac_offdiag = mac.copy()
-    np.fill_diagonal(mac_offdiag, 0.0)
-    mac_max_offdiag = float(np.max(mac_offdiag)) if mac_offdiag.size else 0.0
-
-    rigid_mode_indices = [
-        int(i + 1)
-        for i, f in enumerate(freqs_hz)
-        if float(f) < float(config.rigid_mode_cutoff_hz)
-    ]
-    repeated_groups = _detect_repeated_modes(freqs_hz, config.degenerate_mode_rel_tol)
-
-    for i, row in enumerate(mode_rows):
-        row["cumulative_effective_mass_fraction_x"] = float(cum_x[i])
-        row["cumulative_effective_mass_fraction_y"] = float(cum_y[i])
-        row["cumulative_effective_mass_fraction_z"] = float(cum_z[i])
-        row["mass_participation_ratio_x"] = _safe_div(eff_x[i], sum_x, 0.0)
-        row["mass_participation_ratio_y"] = _safe_div(eff_y[i], sum_y, 0.0)
-        row["mass_participation_ratio_z"] = _safe_div(eff_z[i], sum_z, 0.0)
-
-        row["cumulative_mass_participation_by_mode_count_x"] = _serialize_cumulative(cum_x)
-        row["cumulative_mass_participation_by_mode_count_y"] = _serialize_cumulative(cum_y)
-        row["cumulative_mass_participation_by_mode_count_z"] = _serialize_cumulative(cum_z)
-
-        row["residual_mass_fraction_x"] = float(max(0.0, 1.0 - cum_x[-1]))
-        row["residual_mass_fraction_y"] = float(max(0.0, 1.0 - cum_y[-1]))
-        row["residual_mass_fraction_z"] = float(max(0.0, 1.0 - cum_z[-1]))
-
-        row["orthogonality_max_offdiag_mass"] = ortho_mass
-        row["orthogonality_max_offdiag_stiffness"] = ortho_stiff
-        row["mac_max_offdiag"] = mac_max_offdiag
-        row["rigid_body_modes_detected"] = json.dumps(rigid_mode_indices)
-        row["repeated_mode_groups"] = json.dumps(repeated_groups)
-
-    csv_path = config.output_dir / "modal_comprehensive_report.csv"
-    fieldnames = _csv_fieldnames()
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in mode_rows:
-            writer.writerow(row)
-
-    matrices_dir = config.output_dir / "matrices"
-    matrices_dir.mkdir(parents=True, exist_ok=True)
-    _save_matrix_csv(matrices_dir / "mass_orthogonality_matrix.csv", mass_modal_matrix)
-    _save_matrix_csv(matrices_dir / "stiffness_modal_matrix.csv", stiff_modal_matrix)
-    _save_matrix_csv(matrices_dir / "mac_matrix.csv", mac)
-
-    run_summary = {
-        "run_timestamp_utc": run_timestamp,
-        "input_stl": str(config.stl_path),
-        "mesher_used": mesh_info["mesher_used"],
-        "solver_backend": solver_meta.get("solver_backend"),
-        "solver_method": solver_meta.get("solver_method"),
-        "mesh_element_count": int(cells.shape[0]),
-        "mesh_node_count": int(points.shape[0]),
-        "clamped_node_count": int(clamped_nodes.size),
-        "free_dof_count": int(K_free.shape[0]),
-        "mode_count": int(len(mode_rows)),
-        "mode_animation_exported": bool(config.export_mode_animations),
-        "csv_path": str(csv_path),
-    }
-
-    summary_path = config.output_dir / "run_summary.json"
+        summary_path = config.output_dir / "run_summary.json"
+        md_path = config.output_dir / "modal_report.md"
+    run_summary["stage_timings_s"] = {k: float(v) for k, v in stage_timings_s.items()}
     summary_path.write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
-
-    md_path = config.output_dir / "modal_report.md"
     write_markdown_report(md_path, csv_path, mode_rows, run_summary)
+
+    logger.info("Report export complete: csv=%s markdown=%s", csv_path, md_path)
+    logger.info("Timing summary: %s", json.dumps(stage_timings_s, sort_keys=True))
 
     return {
         "csv_path": str(csv_path),
@@ -1895,6 +2112,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, str]:
         "summary_json_path": str(summary_path),
         "mesh_vtu_path": mesh_info["mesh_vtu_path"],
         "animation_root_path": str(config.output_dir / "paraview_animations"),
+        "log_path": str(log_path),
     }
 
 
@@ -1938,9 +2156,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--num-modes", type=int, default=20, help="Number of eigenmodes to extract")
 
-    parser.add_argument("--E", type=float, default=210.0e9, help="Young's modulus [Pa]")
-    parser.add_argument("--nu", type=float, default=0.30, help="Poisson ratio [-]")
-    parser.add_argument("--rho", type=float, default=7800.0, help="Density [kg/m^3]")
+    parser.add_argument(
+        "--elastic-modulus-pa",
+        "--E",
+        dest="elastic_modulus_pa",
+        type=float,
+        default=210.0e9,
+        help="Young's modulus / elastic modulus [Pa]",
+    )
+    parser.add_argument(
+        "--poissons-ratio",
+        "--nu",
+        dest="poissons_ratio",
+        type=float,
+        default=0.30,
+        help="Poisson ratio [-]",
+    )
+    parser.add_argument(
+        "--density-kg-m3",
+        "--rho",
+        dest="density_kg_m3",
+        type=float,
+        default=7800.0,
+        help="Material density [kg/m^3]",
+    )
     parser.add_argument(
         "--anisotropic-constants",
         type=str,
@@ -1952,21 +2191,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mesher",
         type=str,
         default="auto",
-        choices=["auto", "gmsh", "tetgen", "pytetwild", "ftetwild"],
+        choices=["auto", "gmsh", "tetgen"],
         help="Mesher used by stl_to_tetmesh backend",
     )
     parser.add_argument(
         "--fallback-mesher",
         type=str,
         default=None,
-        choices=["gmsh", "tetgen", "pytetwild", "ftetwild"],
+        choices=["gmsh", "tetgen"],
         help="Optional fallback mesher if the primary mesher fails",
     )
     parser.add_argument(
         "--target-edge-size-m",
         type=float,
         default=None,
-        help="Target tetra edge size [m] (maps to gmsh max size)",
+        help="Target tetra edge size [m] (maps to gmsh size cap)",
     )
     parser.add_argument(
         "--max-tet-volume-m3",
@@ -1979,39 +2218,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="pVCRq1.4",
         help="TetGen switches string used when mesher=tetgen (or fallback=tetgen)",
-    )
-    parser.add_argument(
-        "--ftetwild-epsr",
-        type=float,
-        default=None,
-        help="pytetwild envelope size relative to the input bounding-box diagonal",
-    )
-    parser.add_argument(
-        "--ftetwild-stop-energy",
-        type=float,
-        default=None,
-        help="pytetwild stop optimization energy threshold",
-    )
-    parser.add_argument(
-        "--ftetwild-max-threads",
-        type=int,
-        default=None,
-        help="Maximum threads used by pytetwild",
-    )
-    parser.add_argument(
-        "--ftetwild-verbose",
-        action="store_true",
-        help="Show pytetwild console output instead of running it quietly",
-    )
-    parser.add_argument(
-        "--ftetwild-coarsen",
-        action="store_true",
-        help="Ask pytetwild to coarsen the output as much as possible",
-    )
-    parser.add_argument(
-        "--ftetwild-disable-filtering",
-        action="store_true",
-        help="Disable pytetwild filtering and keep the background mesh",
     )
     parser.add_argument(
         "--stl-length-scale",
@@ -2198,6 +2404,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="None (single-part linear-elastic continuum; no contact modeled)",
         help="Contact assumption text included in CSV/Markdown",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show stage-level pipeline timing/progress on the console and write pipeline.log",
+    )
+    parser.add_argument(
+        "--solver-verbose",
+        action="store_true",
+        help="Show per-iteration progress from the jax-iterative backend",
+    )
 
     return parser
 
@@ -2227,17 +2443,18 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         raise ValueError("--mode-animation-cycles must be positive.")
     if float(args.mode_animation_peak_fraction) <= 0.0:
         raise ValueError("--mode-animation-peak-fraction must be positive.")
-    if args.ftetwild_epsr is not None and float(args.ftetwild_epsr) <= 0.0:
-        raise ValueError("--ftetwild-epsr must be positive.")
-    if args.ftetwild_stop_energy is not None and float(args.ftetwild_stop_energy) <= 0.0:
-        raise ValueError("--ftetwild-stop-energy must be positive.")
-    if args.ftetwild_max_threads is not None and int(args.ftetwild_max_threads) <= 0:
-        raise ValueError("--ftetwild-max-threads must be positive.")
+    if float(args.density_kg_m3) <= 0.0:
+        raise ValueError("--density-kg-m3 must be positive.")
+    if float(args.elastic_modulus_pa) <= 0.0:
+        raise ValueError("--elastic-modulus-pa must be positive.")
+    nu = float(args.poissons_ratio)
+    if not (-1.0 < nu < 0.5):
+        raise ValueError("--poissons-ratio must be in the physically stable range (-1, 0.5).")
 
     material = MaterialProperties(
-        density_kg_m3=float(args.rho),
-        elastic_modulus_pa=float(args.E),
-        poissons_ratio=float(args.nu),
+        density_kg_m3=float(args.density_kg_m3),
+        elastic_modulus_pa=float(args.elastic_modulus_pa),
+        poissons_ratio=nu,
         anisotropic_constants=str(args.anisotropic_constants),
     )
 
@@ -2251,12 +2468,6 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         target_edge_size_m=args.target_edge_size_m,
         max_tet_volume_m3=args.max_tet_volume_m3,
         tetgen_switches=str(args.tetgen_switches),
-        ftetwild_epsr=args.ftetwild_epsr,
-        ftetwild_stop_energy=args.ftetwild_stop_energy,
-        ftetwild_max_threads=args.ftetwild_max_threads,
-        ftetwild_verbose=bool(args.ftetwild_verbose),
-        ftetwild_coarsen=bool(args.ftetwild_coarsen),
-        ftetwild_disable_filtering=bool(args.ftetwild_disable_filtering),
         stl_length_scale=float(args.stl_length_scale),
         clean_stl=bool(args.clean_stl),
         clean_keep_largest_component=keep_largest_component,
@@ -2285,6 +2496,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         rayleigh_beta=float(args.rayleigh_beta),
         material_uncertainty_pct=float(args.material_uncertainty_pct),
         contact_assumptions=str(args.contact_assumptions),
+        verbose=bool(args.verbose),
+        solver_verbose=bool(args.solver_verbose),
     )
 
 
@@ -2332,6 +2545,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  Summary:  {outputs['summary_json_path']}")
     print(f"  Mesh:     {outputs['mesh_vtu_path']}")
     print(f"  Anim:     {outputs['animation_root_path']}")
+    print(f"  Log:      {outputs['log_path']}")
     return 0
 
 
