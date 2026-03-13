@@ -1,0 +1,27 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv / local env noise
+.venv/
+.env
+
+# Local vendor clones and nested repositories
+.vendor/
+
+# Local meshing / modal pipeline outputs
+stl_modal_pipeline/runs/
+
+# Benchmark outputs and ad hoc local debug/test artifacts
+testing/data/solver_benchmark/
+testing/data/test_a/debug_case/
+testing/data/test_c/cantilever_beam_modes/
+
+# Generated solver iteration dumps under tracked test trees
+testing/data/**/vtu/solve_*.vtu
+
+# Generic local logs / scratch
+*.log
