@@ -33,6 +33,8 @@ Important files:
   - thin CLI entrypoint for the full pipeline
 - [`stl_modal_pipeline/run_modal_preset.py`](stl_modal_pipeline/run_modal_preset.py)
   - convenience wrapper for the working TetGen + `jax-iterative` preset
+- [`stl_modal_pipeline/run_modal_agent.py`](stl_modal_pipeline/run_modal_agent.py)
+  - agent-facing JSON wrapper around the preset runner
 - [`stl_modal_pipeline/README.md`](stl_modal_pipeline/README.md)
   - pipeline-specific notes
 - [`stl_modal_pipeline/mermaid.md`](stl_modal_pipeline/mermaid.md)
@@ -67,6 +69,7 @@ The repo is organized around a single production workflow.
    - CSV
    - Markdown
    - run summary JSON
+   - run summary figure
    - per-mode data files
    - ParaView VTU/PVD animations
 
@@ -180,6 +183,20 @@ It varies only:
 - density
 - elastic modulus
 - Poisson ratio
+
+### `stl_modal_pipeline/run_modal_agent.py`
+
+This is the agent-facing wrapper.
+
+It executes `run_modal_preset.py`, waits for the run to finish, and then prints one JSON payload containing:
+
+- success/failure
+- return code
+- output paths
+- a copy of `run_summary.json`
+- a compact preview of the first few modes from the CSV
+
+This is the best boundary to hand to a collaborator who wants to call the modal-analysis tool from a multiagent loop.
 
 ## 4. Modal solver backends
 
@@ -344,6 +361,7 @@ Typical output tree:
 - `modal_report.md`
 - `run_summary.json`
 - `pipeline.log`
+- `summary_figures/modal_run_summary.png`
 - `mesh/volume_mesh.vtu`
 - `mode_data/mode_###/`
 - `matrices/`
@@ -359,6 +377,8 @@ Important files:
   - run-level summary including solver metadata and stage timings
 - `pipeline.log`
   - stage-by-stage runtime log and optional iterative residual progress
+- `summary_figures/modal_run_summary.png`
+  - run-level dashboard showing modal frequencies, cumulative mass participation, effective mass fractions, and key run metadata
 - `mesh/volume_mesh.vtu`
   - tetrahedral volume mesh for ParaView
 - `paraview_animations/mode_###/mode_###_animation.pvd`
@@ -408,12 +428,46 @@ cd /workspace/jax_modal_analysis
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 XLA_PYTHON_CLIENT_ALLOCATOR=platform \
 JAX_ENABLE_X64=1 \
-python -m stl_modal_pipeline.run_modal_preset \
+python -m stl_modal_pipeline.run_modal_agent \
   --stl-name v6_hybrid_thick.stl \
   --density-kg-m3 1200 \
   --elastic-modulus-pa 2.5e9 \
   --poissons-ratio 0.35
 ```
+
+### Agent-facing runner
+
+This is the cleanest entrypoint for another tool or multiagent framework.
+
+It calls the preset runner under the hood, then prints one JSON payload to stdout containing:
+
+- success / failure
+- return code
+- output directory
+- paths to the CSV / Markdown / JSON / logs / summary figure
+- a compact preview of the first few modes
+
+```bash
+cd /workspace/jax_modal_analysis
+
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+XLA_PYTHON_CLIENT_ALLOCATOR=platform \
+JAX_ENABLE_X64=1 \
+python -m stl_modal_pipeline.run_modal_agent \
+  --stl-name v1_cricket_fine.stl \
+  --density-kg-m3 1200 \
+  --elastic-modulus-pa 2.5e9 \
+  --poissons-ratio 0.35
+```
+
+### Multiagent integration notes
+
+For an automated scientific loop, the recommended contract is:
+
+- call `python -m stl_modal_pipeline.run_modal_agent ...`
+- trust `run_summary.json` and the wrapper JSON payload first
+- use `modal_comprehensive_report.csv` for structured downstream logic
+- use `modal_report.md` and `summary_figures/modal_run_summary.png` for quick human review
 
 ### Batch run all `v*.stl` files
 
@@ -671,4 +725,5 @@ That will:
 - use the current working iterative solver path
 - request 16 modes
 - create a run folder automatically
-- write logs, reports, mesh files, and mode data
+- write logs, reports, mesh files, mode data, and a summary dashboard figure
+- print one JSON object that another tool can consume directly

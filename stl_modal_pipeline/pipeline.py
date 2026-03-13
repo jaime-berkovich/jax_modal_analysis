@@ -115,6 +115,8 @@ class PipelineConfig:
     mode_animation_frames: int = 24
     mode_animation_cycles: float = 1.0
     mode_animation_peak_fraction: float = 0.05
+    export_summary_figures: bool = True
+    summary_figure_dpi: int = 180
     verbose: bool = False
     solver_verbose: bool = False
 
@@ -1357,6 +1359,145 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
+def _save_run_summary_figure(
+    output_dir: Path,
+    rows: List[Dict[str, Any]],
+    run_summary: Dict[str, Any],
+    *,
+    rigid_mode_cutoff_hz: float,
+    dpi: int,
+) -> Optional[Path]:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    modes = np.array([int(row["mode_number"]) for row in rows], dtype=np.int32)
+    freqs_hz = np.array([float(row["natural_frequency_hz"]) for row in rows], dtype=np.float64)
+    eff_frac_x = np.array(
+        [float(row["effective_modal_mass_fraction_x"]) for row in rows], dtype=np.float64
+    )
+    eff_frac_y = np.array(
+        [float(row["effective_modal_mass_fraction_y"]) for row in rows], dtype=np.float64
+    )
+    eff_frac_z = np.array(
+        [float(row["effective_modal_mass_fraction_z"]) for row in rows], dtype=np.float64
+    )
+    cum_frac_x = np.array(
+        [float(row["cumulative_effective_mass_fraction_x"]) for row in rows], dtype=np.float64
+    )
+    cum_frac_y = np.array(
+        [float(row["cumulative_effective_mass_fraction_y"]) for row in rows], dtype=np.float64
+    )
+    cum_frac_z = np.array(
+        [float(row["cumulative_effective_mass_fraction_z"]) for row in rows], dtype=np.float64
+    )
+
+    figure_dir = output_dir / "summary_figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    figure_path = figure_dir / "modal_run_summary.png"
+
+    rigid_mask = freqs_hz <= float(rigid_mode_cutoff_hz)
+    rigid_mode_count = int(np.count_nonzero(rigid_mask))
+    first_elastic_mode = None
+    if rigid_mode_count < len(rows):
+        first_elastic_mode = rows[rigid_mode_count]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.5), constrained_layout=True)
+
+    ax = axes[0, 0]
+    colors = np.where(rigid_mask, "#d97706", "#2563eb")
+    ax.bar(modes, freqs_hz, color=colors, alpha=0.9, width=0.75)
+    ax.set_title("Natural Frequency by Mode")
+    ax.set_xlabel("Mode number")
+    ax.set_ylabel("Frequency [Hz]")
+    if rigid_mode_count > 0:
+        ax.axvline(rigid_mode_count + 0.5, color="#7c3aed", linestyle="--", linewidth=1.2)
+        ax.text(
+            rigid_mode_count + 0.7,
+            float(np.max(freqs_hz)) * 0.92 if freqs_hz.size else 0.0,
+            f"elastic region starts after mode {rigid_mode_count}",
+            color="#7c3aed",
+            fontsize=9,
+            va="top",
+        )
+    ax.grid(True, axis="y", alpha=0.25)
+
+    ax = axes[0, 1]
+    ax.plot(modes, cum_frac_x, marker="o", linewidth=2.0, label="X", color="#2563eb")
+    ax.plot(modes, cum_frac_y, marker="o", linewidth=2.0, label="Y", color="#059669")
+    ax.plot(modes, cum_frac_z, marker="o", linewidth=2.0, label="Z", color="#dc2626")
+    ax.axhline(0.8, color="#9ca3af", linestyle="--", linewidth=1.0)
+    ax.axhline(0.9, color="#6b7280", linestyle=":", linewidth=1.0)
+    ax.set_title("Cumulative Effective Mass Fraction")
+    ax.set_xlabel("Mode number")
+    ax.set_ylabel("Cumulative fraction")
+    ax.set_ylim(0.0, max(1.0, float(np.max([cum_frac_x.max(), cum_frac_y.max(), cum_frac_z.max()]))) * 1.05)
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+
+    ax = axes[1, 0]
+    n_show = min(12, len(rows))
+    idx = np.arange(n_show)
+    width = 0.24
+    ax.bar(idx - width, eff_frac_x[:n_show], width=width, label="X", color="#2563eb")
+    ax.bar(idx, eff_frac_y[:n_show], width=width, label="Y", color="#059669")
+    ax.bar(idx + width, eff_frac_z[:n_show], width=width, label="Z", color="#dc2626")
+    ax.set_title("Effective Mass Fraction by Mode")
+    ax.set_xlabel("Mode number")
+    ax.set_ylabel("Fraction")
+    ax.set_xticks(idx, [str(int(m)) for m in modes[:n_show]])
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(frameon=False, ncols=3)
+
+    ax = axes[1, 1]
+    ax.axis("off")
+    first = rows[0]
+    summary_lines = [
+        f"Input STL: {Path(str(run_summary['input_stl'])).name}",
+        f"Mesher: {run_summary.get('mesher_used', 'N/A')}",
+        f"Solver: {run_summary.get('solver_backend', 'N/A')} / {run_summary.get('solver_method', 'N/A')}",
+        f"Converged: {run_summary.get('solver_converged', 'N/A')}",
+        f"Iterations: {run_summary.get('solver_iterations_run', 'N/A')}",
+        f"Free DOFs: {run_summary.get('free_dof_count', 'N/A')}",
+        f"Nodes / elements: {int(first['mesh_node_count'])} / {int(first['mesh_element_count'])}",
+        f"Total mass: {_fmt(first['total_mass_kg'])} kg",
+        (
+            "BBox [m]: "
+            f"{_fmt(first['bounding_box_x_m'])} x {_fmt(first['bounding_box_y_m'])} x {_fmt(first['bounding_box_z_m'])}"
+        ),
+        (
+            "Material: "
+            f"rho={_fmt(first['material_density_kg_m3'])}, "
+            f"E={_fmt(first['material_elastic_modulus_pa'])}, "
+            f"nu={_fmt(first['material_poissons_ratio'])}"
+        ),
+        f"Rigid/near-zero modes: {rigid_mode_count}",
+    ]
+    if first_elastic_mode is not None:
+        summary_lines.append(
+            "First elastic mode: "
+            f"#{int(first_elastic_mode['mode_number'])} @ {_fmt(first_elastic_mode['natural_frequency_hz'])} Hz"
+        )
+    ax.text(
+        0.02,
+        0.98,
+        "\n".join(summary_lines),
+        ha="left",
+        va="top",
+        fontsize=10,
+        family="monospace",
+    )
+
+    fig.suptitle("Modal Run Summary", fontsize=15, fontweight="bold")
+    fig.savefig(figure_path, dpi=int(dpi), bbox_inches="tight")
+    plt.close(fig)
+    return figure_path
+
+
 def write_markdown_report(
     md_path: Path,
     csv_path: Path,
@@ -1379,6 +1520,12 @@ def write_markdown_report(
         lines.append(f"- Solver Method: `{run_summary['solver_method']}`")
     lines.append(f"- Output CSV: `{csv_path.name}`")
     lines.append("")
+    summary_figure_path = run_summary.get("summary_figure_path")
+    if summary_figure_path:
+        rel_summary_figure = Path(str(summary_figure_path)).relative_to(md_path.parent)
+        lines.append("## Summary Figure")
+        lines.append(f"![Modal run summary]({rel_summary_figure.as_posix()})")
+        lines.append("")
 
     lines.append("## 1) Mode-by-Mode Dynamic Results")
     lines.append(
@@ -2092,10 +2239,29 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, str]:
             "free_dof_count": int(K_free.shape[0]),
             "mode_count": int(len(mode_rows)),
             "mode_animation_exported": bool(config.export_mode_animations),
+            "summary_figure_exported": False,
+            "summary_figure_path": None,
             "csv_path": str(csv_path),
             "log_path": str(log_path),
             "stage_timings_s": {},
         }
+
+        if config.export_summary_figures:
+            summary_figure_path = _save_run_summary_figure(
+                config.output_dir,
+                mode_rows,
+                run_summary,
+                rigid_mode_cutoff_hz=config.rigid_mode_cutoff_hz,
+                dpi=config.summary_figure_dpi,
+            )
+            if summary_figure_path is not None:
+                run_summary["summary_figure_exported"] = True
+                run_summary["summary_figure_path"] = str(summary_figure_path)
+                logger.info("Summary figure export complete: %s", summary_figure_path)
+            else:
+                logger.warning(
+                    "Summary figure export skipped because matplotlib could not be imported."
+                )
 
         summary_path = config.output_dir / "run_summary.json"
         md_path = config.output_dir / "modal_report.md"
@@ -2112,6 +2278,9 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, str]:
         "summary_json_path": str(summary_path),
         "mesh_vtu_path": mesh_info["mesh_vtu_path"],
         "animation_root_path": str(config.output_dir / "paraview_animations"),
+        "summary_figure_path": str(run_summary["summary_figure_path"])
+        if run_summary.get("summary_figure_path")
+        else "",
         "log_path": str(log_path),
     }
 
@@ -2382,6 +2551,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.05,
         help="Target peak animated displacement as a fraction of geometry bounding-box diagonal",
     )
+    parser.add_argument(
+        "--no-summary-figures",
+        action="store_true",
+        help="Disable export of the run-level summary figure dashboard PNG",
+    )
+    parser.add_argument(
+        "--summary-figure-dpi",
+        type=int,
+        default=180,
+        help="PNG DPI for the run-level summary figure dashboard",
+    )
 
     parser.add_argument(
         "--damping-ratio",
@@ -2443,6 +2623,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         raise ValueError("--mode-animation-cycles must be positive.")
     if float(args.mode_animation_peak_fraction) <= 0.0:
         raise ValueError("--mode-animation-peak-fraction must be positive.")
+    if int(args.summary_figure_dpi) <= 0:
+        raise ValueError("--summary-figure-dpi must be positive.")
     if float(args.density_kg_m3) <= 0.0:
         raise ValueError("--density-kg-m3 must be positive.")
     if float(args.elastic_modulus_pa) <= 0.0:
@@ -2491,6 +2673,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         mode_animation_frames=int(args.mode_animation_frames),
         mode_animation_cycles=float(args.mode_animation_cycles),
         mode_animation_peak_fraction=float(args.mode_animation_peak_fraction),
+        export_summary_figures=not bool(args.no_summary_figures),
+        summary_figure_dpi=int(args.summary_figure_dpi),
         damping_ratio=args.damping_ratio,
         rayleigh_alpha=float(args.rayleigh_alpha),
         rayleigh_beta=float(args.rayleigh_beta),
