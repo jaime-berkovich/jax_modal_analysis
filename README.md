@@ -51,6 +51,12 @@ Important files:
   - subprocess runner for suites A/B/C
 - [`environment.yml`](environment.yml)
   - fallback local environment specification
+- [`citation.bib`](citation.bib)
+  - BibTeX citation entry for this repository
+
+## Citation
+
+If you reference this repository in a paper, report, or slide deck, use the BibTeX entry in [`citation.bib`](citation.bib).
 
 ## 2. High-level architecture
 
