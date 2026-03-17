@@ -76,11 +76,13 @@ Each run overwrites the output directory and writes:
 - `modal_comprehensive_report.csv`
 - `modal_report.md`
 - `run_summary.json`
+- `summary_figures/modal_run_summary.png`
 - `mesh/volume_mesh.vtu`
 - `mode_data/mode_###/...` (per-mode eigenvector, nodal-line, and strain-energy files)
 - `matrices/mass_orthogonality_matrix.csv`
 - `matrices/stiffness_modal_matrix.csv`
 - `matrices/mac_matrix.csv`
+- `paraview_animations/mode_###/...` when `--export-mode-animations` is enabled
 
 ## Notes
 
@@ -99,5 +101,10 @@ Each run overwrites the output directory and writes:
   - `--jax-iter-max-iters`, `--jax-iter-tol`
   - `--jax-iter-cg-max-iters`, `--jax-iter-cg-tol`
   - `--jax-iter-memory-percent`, `--jax-iter-shift-scale`
+  - Animation passthroughs on the preset/agent wrappers:
+    - `--export-mode-animations`
+    - `--mode-animation-frames`
+    - `--mode-animation-cycles`
+    - `--mode-animation-peak-fraction`
 - Metrics not directly available from a single run (for example explicit mesh/BC sensitivity sweeps) are still present in the CSV with explicit `not_evaluated` markers.
 - Rotational DOF eigenvectors are reported as `N/A` for this solid displacement-only formulation.

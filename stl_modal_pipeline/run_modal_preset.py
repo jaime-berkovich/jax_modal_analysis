@@ -15,11 +15,15 @@ def build_preset_command(
     poissons_ratio: float,
     stl_dir: Path,
     runs_dir: Path,
+    export_mode_animations: bool = False,
+    mode_animation_frames: int = 24,
+    mode_animation_cycles: float = 1.0,
+    mode_animation_peak_fraction: float = 0.05,
 ) -> list[str]:
     stl_stem = Path(stl_name).stem
     output_dir = runs_dir / f"{stl_stem}_tetgen_iter_m16"
 
-    return [
+    command = [
         sys.executable,
         "-m",
         "stl_modal_pipeline.run_modal_pipeline",
@@ -48,6 +52,19 @@ def build_preset_command(
         "--verbose",
         "--solver-verbose",
     ]
+    if export_mode_animations:
+        command.extend(
+            [
+                "--export-mode-animations",
+                "--mode-animation-frames",
+                f"{int(mode_animation_frames)}",
+                "--mode-animation-cycles",
+                f"{float(mode_animation_cycles)}",
+                "--mode-animation-peak-fraction",
+                f"{float(mode_animation_peak_fraction)}",
+            ]
+        )
+    return command
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -93,6 +110,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the fully expanded underlying command instead of executing it",
     )
+    parser.add_argument(
+        "--export-mode-animations",
+        action="store_true",
+        help="Export ParaView PVD + VTU animation series for each mode",
+    )
+    parser.add_argument(
+        "--mode-animation-frames",
+        type=int,
+        default=24,
+        help="Number of animation frames per mode when --export-mode-animations is enabled",
+    )
+    parser.add_argument(
+        "--mode-animation-cycles",
+        type=float,
+        default=1.0,
+        help="Number of sine cycles per mode animation when --export-mode-animations is enabled",
+    )
+    parser.add_argument(
+        "--mode-animation-peak-fraction",
+        type=float,
+        default=0.05,
+        help="Peak displacement fraction of bbox diagonal for mode animation export",
+    )
     return parser
 
 
@@ -106,6 +146,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--elastic-modulus-pa must be positive")
     if not (-1.0 < float(args.poissons_ratio) < 0.5):
         raise ValueError("--poissons-ratio must be in (-1, 0.5)")
+    if int(args.mode_animation_frames) <= 0:
+        raise ValueError("--mode-animation-frames must be positive")
+    if float(args.mode_animation_cycles) <= 0.0:
+        raise ValueError("--mode-animation-cycles must be positive")
+    if float(args.mode_animation_peak_fraction) <= 0.0:
+        raise ValueError("--mode-animation-peak-fraction must be positive")
 
     command = build_preset_command(
         stl_name=str(args.stl_name),
@@ -114,6 +160,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         poissons_ratio=float(args.poissons_ratio),
         stl_dir=Path(args.stl_dir),
         runs_dir=Path(args.runs_dir),
+        export_mode_animations=bool(args.export_mode_animations),
+        mode_animation_frames=int(args.mode_animation_frames),
+        mode_animation_cycles=float(args.mode_animation_cycles),
+        mode_animation_peak_fraction=float(args.mode_animation_peak_fraction),
     )
 
     if args.print_only:

@@ -104,6 +104,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the wrapped preset command as JSON without executing it",
     )
+    parser.add_argument(
+        "--export-mode-animations",
+        action="store_true",
+        help="Export ParaView PVD + VTU animation series for each mode",
+    )
+    parser.add_argument(
+        "--mode-animation-frames",
+        type=int,
+        default=24,
+        help="Number of animation frames per mode when --export-mode-animations is enabled",
+    )
+    parser.add_argument(
+        "--mode-animation-cycles",
+        type=float,
+        default=1.0,
+        help="Number of sine cycles per mode animation when --export-mode-animations is enabled",
+    )
+    parser.add_argument(
+        "--mode-animation-peak-fraction",
+        type=float,
+        default=0.05,
+        help="Peak displacement fraction of bbox diagonal for mode animation export",
+    )
     return parser
 
 
@@ -117,6 +140,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--elastic-modulus-pa must be positive")
     if not (-1.0 < float(args.poissons_ratio) < 0.5):
         raise ValueError("--poissons-ratio must be in (-1, 0.5)")
+    if int(args.mode_animation_frames) <= 0:
+        raise ValueError("--mode-animation-frames must be positive")
+    if float(args.mode_animation_cycles) <= 0.0:
+        raise ValueError("--mode-animation-cycles must be positive")
+    if float(args.mode_animation_peak_fraction) <= 0.0:
+        raise ValueError("--mode-animation-peak-fraction must be positive")
 
     output_dir = _preset_output_dir(stl_name=str(args.stl_name), runs_dir=Path(args.runs_dir))
     command = build_preset_command(
@@ -126,6 +155,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         poissons_ratio=float(args.poissons_ratio),
         stl_dir=Path(args.stl_dir),
         runs_dir=Path(args.runs_dir),
+        export_mode_animations=bool(args.export_mode_animations),
+        mode_animation_frames=int(args.mode_animation_frames),
+        mode_animation_cycles=float(args.mode_animation_cycles),
+        mode_animation_peak_fraction=float(args.mode_animation_peak_fraction),
     )
 
     response: Dict[str, Any] = {

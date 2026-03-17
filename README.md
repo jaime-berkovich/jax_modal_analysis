@@ -184,6 +184,13 @@ It varies only:
 - elastic modulus
 - Poisson ratio
 
+Optional passthroughs available on the preset wrapper:
+
+- `--export-mode-animations`
+- `--mode-animation-frames`
+- `--mode-animation-cycles`
+- `--mode-animation-peak-fraction`
+
 ### `stl_modal_pipeline/run_modal_agent.py`
 
 This is the agent-facing wrapper.
@@ -428,11 +435,22 @@ cd /workspace/jax_modal_analysis
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 XLA_PYTHON_CLIENT_ALLOCATOR=platform \
 JAX_ENABLE_X64=1 \
-python -m stl_modal_pipeline.run_modal_agent \
+python -m stl_modal_pipeline.run_modal_preset \
   --stl-name v6_hybrid_thick.stl \
   --density-kg-m3 1200 \
   --elastic-modulus-pa 2.5e9 \
   --poissons-ratio 0.35
+```
+
+To export ParaView animations from the preset wrapper too:
+
+```bash
+python -m stl_modal_pipeline.run_modal_preset \
+  --stl-name v6_hybrid_thick.stl \
+  --density-kg-m3 1200 \
+  --elastic-modulus-pa 2.5e9 \
+  --poissons-ratio 0.35 \
+  --export-mode-animations
 ```
 
 ### Agent-facing runner
@@ -458,6 +476,19 @@ python -m stl_modal_pipeline.run_modal_agent \
   --density-kg-m3 1200 \
   --elastic-modulus-pa 2.5e9 \
   --poissons-ratio 0.35
+```
+
+The agent wrapper accepts the same animation passthrough flags if you want `.pvd` + time-stepped `.vtu` exports while still getting a final JSON payload.
+
+Example with animations enabled:
+
+```bash
+python -m stl_modal_pipeline.run_modal_agent \
+  --stl-name v1_cricket_fine.stl \
+  --density-kg-m3 1500 \
+  --elastic-modulus-pa 3.0e9 \
+  --poissons-ratio 0.35 \
+  --export-mode-animations
 ```
 
 ### Multiagent integration notes
